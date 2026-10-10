@@ -247,18 +247,20 @@ pub(crate) struct ChangeRequestBoardProviders {
 }
 
 impl ChangeRequestBoardProviders {
-    /// The built-in adapters, keeping first pages in `data_dir`. Order
-    /// settles hosts more than one adapter claims.
+    /// The built-in adapters. Order settles hosts more than one adapter
+    /// claims.
+    fn built_in() -> Vec<Arc<dyn ChangeRequestBoardProvider>> {
+        vec![Arc::new(GitHubCli::new())]
+    }
+
+    /// The built-in adapters, keeping first pages in `data_dir`.
     pub(crate) fn new(data_dir: &Path) -> Self {
-        Self::with_adapters(
-            vec![Arc::new(GitHubCli::new())],
-            Some(ChangeRequestStore::new(data_dir)),
-        )
+        Self::with_adapters(Self::built_in(), Some(ChangeRequestStore::new(data_dir)))
     }
 
     /// The built-in adapters, keeping nothing on disk.
     pub(crate) fn without_store() -> Self {
-        Self::with_adapters(vec![Arc::new(GitHubCli::new())], None)
+        Self::with_adapters(Self::built_in(), None)
     }
 
     fn with_adapters(
