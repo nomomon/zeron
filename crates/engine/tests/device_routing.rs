@@ -261,7 +261,7 @@ impl CheckoutChangeRequestLookup for StaticChangeRequestLookup {
         Ok(self.source.clone())
     }
 
-    async fn resolve_github_source(
+    async fn resolve_source(
         &self,
         _source: &CheckoutSourceContext,
     ) -> Result<Option<ChangeRequestSummary>, ChangeRequestError> {
