@@ -13,10 +13,12 @@ use async_trait::async_trait;
 use zeron_proto::{ChangeRequestComment, ChangeRequestFilter, ChangeRequestPage};
 
 use crate::change_request_store::ChangeRequestStore;
-use crate::source_control::{ChangeRequestError, GitHubCli, valid_pr_repository};
+use crate::source_control::{ChangeRequestError, GitHubCli, GitLabCli, valid_pr_repository};
 
 pub(crate) const GITHUB_PROVIDER: &str = "github";
 pub(crate) const GITHUB_HOST: &str = "github.com";
+pub(crate) const GITLAB_PROVIDER: &str = "gitlab";
+pub(crate) const GITLAB_HOST: &str = "gitlab.com";
 
 /// One repository on one provider host. `path` is the repository's full path
 /// as the host names it: `owner/repo` on GitHub, while GitLab nests groups
@@ -30,18 +32,40 @@ pub(crate) struct ChangeRequestScope {
 }
 
 impl ChangeRequestScope {
-    /// The board's wire form predates other hosts: a bare `owner/repo` always
-    /// means github.com, and nothing else is accepted.
-    pub(crate) fn from_wire(repository: &str) -> Option<Self> {
-        valid_pr_repository(repository).then(|| Self {
-            provider: GITHUB_PROVIDER,
-            host: GITHUB_HOST.into(),
-            path: repository.into(),
+    /// `path` on `host`, when `provider` can name it there: `owner/repo` on
+    /// github.com, or a project under at least one group on a GitLab host.
+    pub(crate) fn new(provider: &'static str, host: &str, path: &str) -> Option<Self> {
+        let host = host.to_ascii_lowercase();
+        let valid = match provider {
+            GITHUB_PROVIDER => host == GITHUB_HOST && valid_pr_repository(path),
+            GITLAB_PROVIDER => host != GITHUB_HOST && valid_host(&host) && valid_gitlab_path(path),
+            _ => false,
+        };
+        valid.then(|| Self {
+            provider,
+            host,
+            path: path.into(),
         })
     }
 
+    /// The board's wire form. A bare `owner/repo` means github.com, as it
+    /// always has, so older peers keep working. Any other host travels
+    /// qualified, `host/group/.../project`, and is GitLab's; engines that
+    /// accept that form advertise `change-requests-gitlab-v1`.
+    pub(crate) fn from_wire(repository: &str) -> Option<Self> {
+        if valid_pr_repository(repository) {
+            return Self::new(GITHUB_PROVIDER, GITHUB_HOST, repository);
+        }
+        let (host, path) = repository.split_once('/')?;
+        Self::new(GITLAB_PROVIDER, host, path)
+    }
+
     pub(crate) fn to_wire(&self) -> String {
-        self.path.clone()
+        if self.provider == GITHUB_PROVIDER {
+            self.path.clone()
+        } else {
+            format!("{}/{}", self.host, self.path)
+        }
     }
 
     /// Hosts and repository paths compare without case, as GitHub and GitLab
@@ -51,6 +75,33 @@ impl ChangeRequestScope {
             && self.host.eq_ignore_ascii_case(&other.host)
             && self.path.eq_ignore_ascii_case(&other.path)
     }
+}
+
+/// A hostname as remotes and URLs carry it, never an option or a user. A dot
+/// is required, so a qualified scope can't be mistaken for `owner/repo`.
+pub(crate) fn valid_host(host: &str) -> bool {
+    (1..=253).contains(&host.len())
+        && host.contains('.')
+        && !host.starts_with(['-', '.'])
+        && host
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+}
+
+/// A GitLab project's full path: a project under one or more groups, which
+/// GitLab nests at most 20 deep.
+pub(crate) fn valid_gitlab_path(path: &str) -> bool {
+    let parts: Vec<_> = path.split('/').collect();
+    (2..=21).contains(&parts.len())
+        && path.len() <= 512
+        && parts.iter().all(|part| {
+            !part.is_empty()
+                && *part != "."
+                && *part != ".."
+                && part
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+        })
 }
 
 /// What the board needs from one provider. Every method validates its own
@@ -66,10 +117,10 @@ pub(crate) trait ChangeRequestBoardProvider: Send + Sync {
     /// Whether `url` names a change request this adapter can open.
     fn owns_url(&self, url: &str) -> bool;
 
-    /// The signed-in account the on-disk store keys pages by, read locally.
-    /// Each adapter namespaces its own keys. `None` when it can't be told,
-    /// and then nothing is stored.
-    async fn account_key(&self) -> Option<String>;
+    /// The account signed in on `host` that the on-disk store keys pages
+    /// by, read locally. Each adapter namespaces its own keys. `None` when it
+    /// can't be told, and then nothing is stored.
+    async fn account_key(&self, host: &str) -> Option<String>;
 
     /// The provider's current name for `scope`, following renames.
     async fn canonical_scope(&self, scope: &ChangeRequestScope) -> Option<ChangeRequestScope>;
@@ -111,7 +162,10 @@ pub(crate) struct ChangeRequestBoardProviders {
 impl ChangeRequestBoardProviders {
     /// The built-in adapters, keeping first pages in `data_dir`.
     pub(crate) fn new(data_dir: &Path) -> Self {
-        Self::with_adapters(vec![Arc::new(GitHubCli::new().with_store(data_dir))])
+        Self::with_adapters(vec![
+            Arc::new(GitHubCli::new().with_store(data_dir)),
+            Arc::new(GitLabCli::new().with_store(data_dir)),
+        ])
     }
 
     fn with_adapters(adapters: Vec<Arc<dyn ChangeRequestBoardProvider>>) -> Self {
@@ -124,6 +178,15 @@ impl ChangeRequestBoardProviders {
         self.adapters
             .retain(|adapter| adapter.provider_id() != GITHUB_PROVIDER);
         self.adapters.insert(0, Arc::new(github));
+        self
+    }
+
+    /// Replace the GitLab adapter.
+    #[cfg(test)]
+    pub(crate) fn with_gitlab(mut self, gitlab: GitLabCli) -> Self {
+        self.adapters
+            .retain(|adapter| adapter.provider_id() != GITLAB_PROVIDER);
+        self.adapters.push(Arc::new(gitlab));
         self
     }
 
@@ -151,13 +214,11 @@ impl ChangeRequestBoardProviders {
             .ok_or(ChangeRequestError::UnsupportedRepository)
     }
 
-    /// `path` on `host` as a scope, when an adapter serves that host.
+    /// `path` on `host` as a scope, when an adapter serves that host and
+    /// can name the path.
     pub(crate) fn scope(&self, host: &str, path: &str) -> Option<ChangeRequestScope> {
-        self.for_host(host).map(|adapter| ChangeRequestScope {
-            provider: adapter.provider_id(),
-            host: host.to_ascii_lowercase(),
-            path: path.into(),
-        })
+        self.for_host(host)
+            .and_then(|adapter| ChangeRequestScope::new(adapter.provider_id(), host, path))
     }
 
     pub(crate) async fn canonical_scope(
@@ -210,7 +271,7 @@ impl ChangeRequestBoardProviders {
 pub(crate) async fn stored_page<P>(
     provider: &P,
     store: Option<&ChangeRequestStore>,
-    repository: &str,
+    scope: &ChangeRequestScope,
     filter: ChangeRequestFilter,
     after: Option<&str>,
     refresh: bool,
@@ -220,9 +281,11 @@ pub(crate) async fn stored_page<P>(
 where
     P: ChangeRequestBoardProvider + ?Sized,
 {
+    let repository = scope.to_wire();
+    let repository = repository.as_str();
     let stored = match store {
         Some(store) if after.is_none() => provider
-            .account_key()
+            .account_key(&scope.host)
             .await
             .map(|account| (store.clone(), account)),
         _ => None,
@@ -380,7 +443,116 @@ mod tests {
             provider: GITHUB_PROVIDER,
             ..scope.clone()
         }));
-        // The wire keeps today's strict owner/repo form in this version.
+        // A bare path names no host, so it is never a GitLab scope.
         assert_eq!(ChangeRequestScope::from_wire(&scope.path), None);
+    }
+
+    #[test]
+    fn gitlab_scopes_travel_host_qualified() {
+        let wire = "GitLab.com/acme/platform/team/api";
+        let scope = ChangeRequestScope::from_wire(wire).unwrap();
+        assert_eq!(scope.provider, GITLAB_PROVIDER);
+        assert_eq!(scope.host, "gitlab.com");
+        assert_eq!(scope.path, "acme/platform/team/api");
+        assert_eq!(
+            scope.to_wire(),
+            "gitlab.com/acme/platform/team/api"
+        );
+        assert_eq!(ChangeRequestScope::from_wire(&scope.to_wire()), Some(scope));
+        assert_eq!(
+            ChangeRequestScope::from_wire("git.example.org/group/project")
+                .map(|scope| (scope.host, scope.path)),
+            Some(("git.example.org".into(), "group/project".into()))
+        );
+        for repository in [
+            // A host needs a dot, so three bare segments stay invalid.
+            "acme/zeron/extra",
+            // GitHub keeps its bare owner/repo form.
+            "github.com/acme/zeron",
+            "gitlab.com/group//project",
+            "gitlab.com/group/../project",
+            "-gitlab.com/group/project",
+            "gitlab.com:22/group/project",
+            "user@gitlab.com/group/project",
+            "gitlab.com/group/project?x",
+            "gitlab.com/group/pro ject",
+        ] {
+            assert_eq!(
+                ChangeRequestScope::from_wire(repository),
+                None,
+                "{repository}"
+            );
+        }
+        let deep = format!("gitlab.com/{}project", "group/".repeat(21));
+        assert_eq!(ChangeRequestScope::from_wire(&deep), None);
+        // Two segments are always GitHub's owner/repo, as before.
+        assert_eq!(
+            ChangeRequestScope::from_wire("gitlab.com/project").map(|scope| scope.provider),
+            Some(GITHUB_PROVIDER)
+        );
+    }
+
+    #[test]
+    fn gitlab_hosts_and_urls_route_to_the_gitlab_adapter() {
+        let providers =
+            github_only().with_gitlab(GitLabCli::new().with_hosts(&["git.example.org"]));
+        for host in ["gitlab.com", "GitLab.com", "git.example.org"] {
+            assert_eq!(
+                providers
+                    .for_host(host)
+                    .map(|adapter| adapter.provider_id()),
+                Some(GITLAB_PROVIDER),
+                "{host}"
+            );
+        }
+        assert_eq!(
+            providers
+                .for_host("github.com")
+                .map(|adapter| adapter.provider_id()),
+            Some(GITHUB_PROVIDER)
+        );
+        for host in ["gitlab.example.com", "example.org"] {
+            assert!(providers.for_host(host).is_none(), "{host}");
+        }
+        assert_eq!(
+            providers.scope("gitlab.com", "acme/platform/team/api"),
+            ChangeRequestScope::from_wire("gitlab.com/acme/platform/team/api")
+        );
+        // Each provider names paths its own way.
+        assert_eq!(providers.scope("github.com", "acme/zeron/extra"), None);
+        assert_eq!(providers.scope("gitlab.com", "project"), None);
+        for url in [
+            "https://gitlab.com/acme/platform/team/api/-/merge_requests/441",
+            "https://git.example.org/group/project/-/merge_requests/1",
+        ] {
+            assert_eq!(
+                providers.for_url(url).map(|adapter| adapter.provider_id()),
+                Ok(GITLAB_PROVIDER),
+                "{url}"
+            );
+        }
+        assert_eq!(
+            providers
+                .for_url("https://github.com/acme/zeron/pull/12")
+                .map(|adapter| adapter.provider_id()),
+            Ok(GITHUB_PROVIDER)
+        );
+        for url in [
+            "https://gitlab.example.com/group/project/-/merge_requests/1",
+            "http://gitlab.com/group/project/-/merge_requests/1",
+            "https://user@gitlab.com/group/project/-/merge_requests/1",
+            "https://gitlab.com:8443/group/project/-/merge_requests/1",
+            "https://gitlab.com/project/-/merge_requests/1",
+            "https://gitlab.com/group/project/-/merge_requests/0",
+            "https://gitlab.com/group/project/-/merge_requests/1/diffs",
+            "https://gitlab.com/group/project/-/issues/1",
+            "https://gitlab.com/group/project/merge_requests/1",
+        ] {
+            assert_eq!(
+                providers.for_url(url).err(),
+                Some(ChangeRequestError::UnsupportedRepository),
+                "{url}"
+            );
+        }
     }
 }

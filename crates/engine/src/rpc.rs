@@ -730,6 +730,12 @@ impl EngineRpc {
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_gitlab(mut self, gitlab: crate::source_control::GitLabCli) -> Self {
+        self.board_providers = self.board_providers.with_gitlab(gitlab);
+        self
+    }
+
     fn auth(&self) -> Result<&Auth, RpcError> {
         self.auth
             .as_ref()
@@ -2617,7 +2623,9 @@ impl RpcService for EngineRpc {
                 }
                 let p: P = parse_params(params)?;
                 let Some(scope) = ChangeRequestScope::from_wire(&p.repository) else {
-                    return Err(RpcError::BadParams("repository must be owner/repo".into()));
+                    return Err(RpcError::BadParams(
+                        "repository must be owner/repo or host/group/project".into(),
+                    ));
                 };
                 if p.after
                     .as_deref()

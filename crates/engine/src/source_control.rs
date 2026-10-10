@@ -3,8 +3,12 @@
 //! Process execution and provider calls intentionally live outside this layer so
 //! remote parsing and head selector construction remain deterministic and testable.
 
+#[path = "source_control_gitlab.rs"]
+mod gitlab;
 #[path = "source_control_review_threads.rs"]
 mod review_threads;
+
+pub(crate) use gitlab::GitLabCli;
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -282,23 +286,24 @@ impl ChangeRequestResolver {
         self.remote_repository(remote_url, |host| host.eq_ignore_ascii_case(GITHUB_HOST))
             .await
             .map(|(_, path)| path)
+            .filter(|path| valid_pr_repository(path))
     }
 
-    /// The host and `owner/name` of a remote on a host `served` accepts. An
-    /// SSH remote may name a host alias from `~/.ssh/config`
-    /// (`git@github-work:acme/zeron.git`); `ssh -G` resolves it locally
-    /// without connecting.
+    /// The host and repository path of a remote on a host `served` accepts.
+    /// The path is whole (`group/subgroup/project` on GitLab); the provider
+    /// decides whether it names a repository. An SSH remote may name a host
+    /// alias from `~/.ssh/config` (`git@github-work:acme/zeron.git`); `ssh -G`
+    /// resolves it locally without connecting.
     async fn remote_repository(
         &self,
         remote_url: &str,
         served: impl Fn(&str) -> bool,
     ) -> Option<(String, String)> {
-        let remote = parse_git_remote(remote_url)?;
-        let slug = format!("{}/{}", remote.owner, remote.repository);
-        if served(&remote.host) {
-            return Some((remote.host, slug));
+        let (host, slug) = parse_git_remote_path(remote_url)?;
+        if served(&host) {
+            return Some((host, slug));
         }
-        if !is_ssh_remote(remote_url) || !valid_ssh_alias(&remote.host) {
+        if !is_ssh_remote(remote_url) || !valid_ssh_alias(&host) {
             return None;
         }
         let output = self
@@ -306,7 +311,7 @@ impl ChangeRequestResolver {
             .runner
             .run(ProcessRequest {
                 program: "ssh".into(),
-                args: vec!["-G".into(), remote.host.clone()],
+                args: vec!["-G".into(), host],
                 stdin: None,
                 cwd: None,
                 env: Vec::new(),
@@ -394,81 +399,11 @@ pub struct GitHubCli {
 }
 
 impl GitHubCli {
-    /// Shared across RPC clients on this engine. Simultaneous identical reads
-    /// share one provider call; distinct reads run side by side. The read runs
-    /// detached, so it completes and is cached even when every caller has gone
-    /// away. Never retry here.
     async fn cached_pr_request<F>(&self, key: String, refresh: bool, fetch: F) -> PrResult
     where
         F: std::future::Future<Output = PrResult> + Send + 'static,
     {
-        use futures::FutureExt;
-        let mut cache = self.pr_cache.lock().await;
-        if let Some(index) = cache.entries.iter().position(|entry| entry.0 == key) {
-            let entry = cache.entries.remove(index);
-            let ttl = match &entry.2 {
-                Err(ChangeRequestError::RateLimited) => Duration::from_secs(15 * 60),
-                // An explicit retry always reaches GitHub again.
-                Err(_) if refresh => Duration::ZERO,
-                Err(_) => Duration::from_secs(60),
-                Ok(_) if refresh => Duration::from_secs(15),
-                Ok(_) => Duration::from_secs(5 * 60),
-            };
-            let fresh = entry.1.elapsed() < ttl;
-            let result = entry.2.clone();
-            cache.entries.push(entry);
-            if fresh {
-                return result;
-            }
-        }
-        if cache
-            .rate_limited_at
-            .is_some_and(|at| at.elapsed() < Duration::from_secs(15 * 60))
-        {
-            return Err(ChangeRequestError::RateLimited);
-        }
-        let pending = match cache.in_flight.get(&key) {
-            Some((_, pending)) => pending.clone(),
-            None => {
-                let id = cache.next_fetch;
-                cache.next_fetch += 1;
-                let shared = self.pr_cache.clone();
-                let task_key = key.clone();
-                let task = tokio::spawn(async move {
-                    let result = std::panic::AssertUnwindSafe(fetch)
-                        .catch_unwind()
-                        .await
-                        .unwrap_or(Err(ChangeRequestError::CommandFailed));
-                    let mut cache = shared.lock().await;
-                    if matches!(result, Err(ChangeRequestError::RateLimited)) {
-                        cache.rate_limited_at = Some(Instant::now());
-                    }
-                    if cache
-                        .in_flight
-                        .get(&task_key)
-                        .is_some_and(|(current, _)| *current == id)
-                    {
-                        cache.in_flight.remove(&task_key);
-                        cache.entries.retain(|entry| entry.0 != task_key);
-                        cache
-                            .entries
-                            .push((task_key, Instant::now(), result.clone()));
-                        if cache.entries.len() > 24 {
-                            let _ = cache.entries.remove(0);
-                        }
-                    }
-                    result
-                });
-                let pending =
-                    async move { task.await.unwrap_or(Err(ChangeRequestError::CommandFailed)) }
-                        .boxed()
-                        .shared();
-                cache.in_flight.insert(key, (id, pending.clone()));
-                pending
-            }
-        };
-        drop(cache);
-        pending.await
+        cached_request(&self.pr_cache, key, refresh, fetch).await
     }
 
     pub async fn detail(
@@ -876,16 +811,18 @@ impl GitHubCli {
         refresh: bool,
         cached: bool,
     ) -> Result<zeron_proto::ChangeRequestPage, ChangeRequestError> {
-        if !valid_pr_repository(repository) {
+        let Some(scope) = ChangeRequestScope::from_wire(repository)
+            .filter(|scope| scope.provider == GITHUB_PROVIDER)
+        else {
             return Err(ChangeRequestError::UnsupportedRepository);
-        }
+        };
         if after.is_some_and(|cursor| !valid_page_cursor(cursor)) {
             return Err(ChangeRequestError::Decode);
         }
         crate::change_request_board::stored_page(
             self,
             self.store.as_ref(),
-            repository,
+            &scope,
             filter,
             after,
             refresh,
@@ -1117,6 +1054,88 @@ impl GitHubCli {
     }
 }
 
+/// Shared across RPC clients on this engine. Simultaneous identical reads
+/// share one provider call; distinct reads run side by side. The read runs
+/// detached, so it completes and is cached even when every caller has gone
+/// away. Never retry here.
+async fn cached_request<F>(
+    pr_cache: &Arc<tokio::sync::Mutex<PrRequestCache>>,
+    key: String,
+    refresh: bool,
+    fetch: F,
+) -> PrResult
+where
+    F: std::future::Future<Output = PrResult> + Send + 'static,
+{
+    use futures::FutureExt;
+    let mut cache = pr_cache.lock().await;
+    if let Some(index) = cache.entries.iter().position(|entry| entry.0 == key) {
+        let entry = cache.entries.remove(index);
+        let ttl = match &entry.2 {
+            Err(ChangeRequestError::RateLimited) => Duration::from_secs(15 * 60),
+            // An explicit retry always reaches GitHub again.
+            Err(_) if refresh => Duration::ZERO,
+            Err(_) => Duration::from_secs(60),
+            Ok(_) if refresh => Duration::from_secs(15),
+            Ok(_) => Duration::from_secs(5 * 60),
+        };
+        let fresh = entry.1.elapsed() < ttl;
+        let result = entry.2.clone();
+        cache.entries.push(entry);
+        if fresh {
+            return result;
+        }
+    }
+    if cache
+        .rate_limited_at
+        .is_some_and(|at| at.elapsed() < Duration::from_secs(15 * 60))
+    {
+        return Err(ChangeRequestError::RateLimited);
+    }
+    let pending = match cache.in_flight.get(&key) {
+        Some((_, pending)) => pending.clone(),
+        None => {
+            let id = cache.next_fetch;
+            cache.next_fetch += 1;
+            let shared = pr_cache.clone();
+            let task_key = key.clone();
+            let task = tokio::spawn(async move {
+                let result = std::panic::AssertUnwindSafe(fetch)
+                    .catch_unwind()
+                    .await
+                    .unwrap_or(Err(ChangeRequestError::CommandFailed));
+                let mut cache = shared.lock().await;
+                if matches!(result, Err(ChangeRequestError::RateLimited)) {
+                    cache.rate_limited_at = Some(Instant::now());
+                }
+                if cache
+                    .in_flight
+                    .get(&task_key)
+                    .is_some_and(|(current, _)| *current == id)
+                {
+                    cache.in_flight.remove(&task_key);
+                    cache.entries.retain(|entry| entry.0 != task_key);
+                    cache
+                        .entries
+                        .push((task_key, Instant::now(), result.clone()));
+                    if cache.entries.len() > 24 {
+                        let _ = cache.entries.remove(0);
+                    }
+                }
+                result
+            });
+            let pending =
+                async move { task.await.unwrap_or(Err(ChangeRequestError::CommandFailed)) }
+                    .boxed()
+                    .shared();
+            cache.in_flight.insert(key, (id, pending.clone()));
+            pending
+        }
+    };
+    drop(cache);
+    pending.await
+}
+
 /// Board requests run against GitHub.com without a checkout or interactive prompts.
 fn github_request() -> ProcessRequest {
     ProcessRequest {
@@ -1198,7 +1217,7 @@ impl ChangeRequestBoardProvider for GitHubCli {
     }
 
     /// Bare `gh` logins, as stores written before other providers keyed them.
-    async fn account_key(&self) -> Option<String> {
+    async fn account_key(&self, _host: &str) -> Option<String> {
         self.store_account().await
     }
 
@@ -1296,6 +1315,22 @@ impl BranchHeadContext {
 /// The host is intentionally not restricted to `github.com`: GitHub Enterprise
 /// installations use arbitrary hostnames and are resolved later by the provider.
 pub fn parse_git_remote(remote_url: &str) -> Option<GitRemote> {
+    let (host, path) = parse_git_remote_path(remote_url)?;
+    let (owner, repository) = path.split_once('/')?;
+    if repository.contains('/') {
+        return None;
+    }
+    Some(GitRemote {
+        host,
+        owner: owner.to_owned(),
+        repository: repository.to_owned(),
+    })
+}
+
+/// The lowercase host and whole repository path of a remote in the forms
+/// [`parse_git_remote`] accepts, keeping nested groups
+/// (`git@gitlab.com:group/subgroup/project.git`). Ports and users are dropped.
+fn parse_git_remote_path(remote_url: &str) -> Option<(String, String)> {
     let remote_url = remote_url.trim();
     if remote_url.is_empty() || remote_url.chars().any(char::is_whitespace) {
         return None;
@@ -1319,22 +1354,13 @@ pub fn parse_git_remote(remote_url: &str) -> Option<GitRemote> {
     };
 
     let path = path.trim_matches('/');
-    let mut segments = path.split('/');
-    let owner = segments.next()?;
-    let repository = segments.next()?;
-    if segments.next().is_some() || owner.is_empty() || repository.is_empty() {
-        return None;
-    }
-    let repository = repository.strip_suffix(".git").unwrap_or(repository);
-    if repository.is_empty() {
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let segments: Vec<_> = path.split('/').collect();
+    if segments.len() < 2 || segments.iter().any(|segment| segment.is_empty()) {
         return None;
     }
 
-    Some(GitRemote {
-        host: host.to_ascii_lowercase(),
-        owner: owner.to_owned(),
-        repository: repository.to_owned(),
-    })
+    Some((host.to_ascii_lowercase(), path.to_owned()))
 }
 
 /// The scp-like (`git@host:owner/repo`) and `ssh://` forms, whose host may
@@ -2124,7 +2150,7 @@ struct SystemProcessRunner;
 impl ProcessRunner for SystemProcessRunner {
     async fn run(&self, request: ProcessRequest) -> Result<ProcessOutput, ProcessRunError> {
         let mut command = tokio::process::Command::new(&request.program);
-        if request.program == "gh" {
+        if matches!(request.program.as_str(), "gh" | "glab") {
             zeron_harness::compose_login_shell_path(&mut command);
         }
         #[cfg(windows)]
@@ -2218,13 +2244,13 @@ mod tests {
     use super::*;
 
     #[derive(Default)]
-    struct FakeProcessRunner {
+    pub(super) struct FakeProcessRunner {
         requests: Mutex<Vec<ProcessRequest>>,
         responses: Mutex<VecDeque<Result<ProcessOutput, ProcessRunError>>>,
     }
 
     impl FakeProcessRunner {
-        fn with_responses(
+        pub(super) fn with_responses(
             responses: impl IntoIterator<Item = Result<ProcessOutput, ProcessRunError>>,
         ) -> Arc<Self> {
             Arc::new(Self {
@@ -2233,7 +2259,7 @@ mod tests {
             })
         }
 
-        fn requests(&self) -> Vec<ProcessRequest> {
+        pub(super) fn requests(&self) -> Vec<ProcessRequest> {
             self.requests.lock().unwrap().clone()
         }
     }
@@ -2298,7 +2324,9 @@ mod tests {
         );
     }
 
-    fn command_success(stdout: impl Into<Vec<u8>>) -> Result<ProcessOutput, ProcessRunError> {
+    pub(super) fn command_success(
+        stdout: impl Into<Vec<u8>>,
+    ) -> Result<ProcessOutput, ProcessRunError> {
         Ok(ProcessOutput {
             success: true,
             stdout: stdout.into(),
@@ -2672,6 +2700,126 @@ mod tests {
         assert!(!requests[8].args.iter().any(|arg| arg.contains(body)));
     }
 
+    /// A checkout whose origin is a nested GitLab project resolves to its
+    /// host-qualified scope, and that scope lists merge requests over the
+    /// real engine dispatch. Only `glab` is scripted.
+    #[tokio::test]
+    async fn gitlab_board_crosses_engine_transport() {
+        use serde_json::json;
+        use zeron_proto::ChangeRequestPage;
+        use zeron_rpc::methods;
+
+        let dir = tempfile::tempdir().unwrap();
+        let checkout = dir.path().join("checkout");
+        std::fs::create_dir(&checkout).unwrap();
+        run_git(&checkout, &["init", "--quiet"]);
+        run_git(
+            &checkout,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "git@gitlab.com:acme/platform/team/api.git",
+            ],
+        );
+        let core = crate::EngineCore::assemble(
+            &dir.path().join("engine"),
+            Arc::new(crate::HarnessRegistry::new()),
+            zeron_proto::HarnessId::Mock,
+            None,
+        )
+        .unwrap();
+        core.workspace
+            .create_space(
+                "space-mr",
+                &core.device_id,
+                &checkout.to_string_lossy(),
+                None,
+                true,
+            )
+            .unwrap();
+        let head = "a".repeat(40);
+        let page = json!({"data": {
+            "currentUser": {"username": "devuser"},
+            "project": {
+                "fullPath": "acme/platform/team/api",
+                "mergeRequests": {
+                    "count": 1,
+                    "pageInfo": {"hasNextPage": false, "endCursor": null},
+                    "nodes": [{
+                        "iid": "441", "title": "Parse documents", "draft": false,
+                        "webUrl": "https://gitlab.com/acme/platform/team/api/-/merge_requests/441",
+                        "createdAt": "2026-08-10T09:30:00Z", "updatedAt": "2026-08-19T12:00:00Z",
+                        "author": {"username": "devuser"},
+                        "diffStatsSummary": {"additions": 12, "deletions": 3},
+                        "diffHeadSha": head, "headPipeline": {"status": "FAILED", "sha": head},
+                        "conflicts": false, "mergeStatusEnum": "CAN_BE_MERGED",
+                        "approved": false, "approvalsLeft": 0, "reviewers": {"nodes": []}
+                    }]
+                }
+            }
+        }});
+        let runner = FakeProcessRunner::with_responses([
+            // Another project on the same host is checked for a rename.
+            command_success(
+                r#"{"data":{"project":{"fullPath":"acme/platform/team/api"}}}"#,
+            ),
+            command_success(serde_json::to_vec(&page).unwrap()),
+        ]);
+        let rpc = Arc::try_unwrap(core.rpc_service())
+            .ok()
+            .unwrap()
+            .with_gitlab(GitLabCli::with_runner(runner.clone()));
+        let client = zeron_rpc::memory_client(Arc::new(rpc));
+        let wire = "gitlab.com/acme/platform/team/api";
+        let repository: Option<String> = client
+            .call_as(
+                methods::GET_CHANGE_REQUEST_REPOSITORY,
+                json!({"cwd": checkout}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(repository.as_deref(), Some(wire));
+        for (wanted, expected) in [
+            (
+                "GitLab.com/Acme/Platform/team/api",
+                Some(wire),
+            ),
+            ("gitlab.com/acme/platform/team/other", None),
+            ("acme/api", None),
+        ] {
+            let matched: Option<String> = client
+                .call_as(
+                    methods::GET_CHANGE_REQUEST_REPOSITORY,
+                    json!({"cwd": checkout, "repository": wanted}),
+                )
+                .await
+                .unwrap();
+            assert_eq!(matched.as_deref(), expected, "{wanted}");
+        }
+        let listed: ChangeRequestPage = client
+            .call_as(
+                methods::LIST_CHANGE_REQUEST_PAGE,
+                json!({"repository": wire, "filter": "all"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed.items.len(), 1);
+        assert_eq!(listed.items[0].number, 441);
+        assert_eq!(listed.items[0].repository, wire);
+        assert_eq!(listed.items[0].provider, "gitlab");
+        for repository in ["gitlab.com/group//project", "acme/zeron/extra"] {
+            let refused = client
+                .call(
+                    methods::LIST_CHANGE_REQUEST_PAGE,
+                    json!({"repository": repository, "filter": "all"}),
+                )
+                .await;
+            assert!(refused.is_err(), "{repository}");
+        }
+        assert_eq!(runner.requests().len(), 2);
+    }
+
     #[tokio::test]
     async fn pr_known_revision_bypasses_recent_detail_cache_and_pins_diff() {
         use serde_json::json;
@@ -2777,6 +2925,7 @@ mod tests {
     async fn board_scopes_route_remotes_by_resolved_host() {
         let runner = FakeProcessRunner::with_responses([
             command_success("user git\nhostname GitHub.com\n"),
+            command_success("user git\nhostname gitlab.com\n"),
             command_success("user git\nhostname gitlab.example.com\n"),
         ]);
         let resolver = ChangeRequestResolver {
@@ -2785,7 +2934,8 @@ mod tests {
         };
         let dir = tempfile::tempdir().unwrap();
         let providers = ChangeRequestBoardProviders::new(dir.path())
-            .with_github(GitHubCli::with_runner(runner.clone()));
+            .with_github(GitHubCli::with_runner(runner.clone()))
+            .with_gitlab(GitLabCli::new().with_hosts(&["git.example.org"]));
         let github = ChangeRequestScope::from_wire("acme/zeron");
         for remote in [
             "https://github.com/acme/zeron.git",
@@ -2799,9 +2949,43 @@ mod tests {
                 "{remote}"
             );
         }
+        let nested =
+            ChangeRequestScope::from_wire("gitlab.com/acme/platform/team/api");
         for remote in [
-            "https://gitlab.com/acme/zeron.git",
-            "git@gitlab-work:acme/zeron.git",
+            "git@gitlab.com:acme/platform/team/api.git",
+            "https://gitlab.com/acme/platform/team/api.git",
+            "https://oauth2@GitLab.com:443/acme/platform/team/api/",
+            "ssh://git@gitlab.com:22/acme/platform/team/api.git",
+            "git@gitlab-work:acme/platform/team/api.git",
+        ] {
+            assert_eq!(
+                resolver.remote_scope(remote, &providers).await,
+                nested,
+                "{remote}"
+            );
+        }
+        assert_eq!(
+            resolver
+                .remote_scope("git@git.example.org:2222:group/project.git", &providers)
+                .await,
+            None
+        );
+        assert_eq!(
+            resolver
+                .remote_scope(
+                    "ssh://git@git.example.org:2222/group/project.git",
+                    &providers
+                )
+                .await,
+            ChangeRequestScope::from_wire("git.example.org/group/project")
+        );
+        for remote in [
+            // GitHub repositories are never nested.
+            "https://github.com/acme/zeron/extra.git",
+            "https://gitlab.com/acme.git",
+            // A host no adapter serves, directly or behind an alias.
+            "https://gitlab.example.com/acme/zeron.git",
+            "git@gitlab-other:acme/zeron.git",
         ] {
             assert_eq!(
                 resolver.remote_scope(remote, &providers).await,
@@ -2809,7 +2993,7 @@ mod tests {
                 "{remote}"
             );
         }
-        assert_eq!(runner.requests().len(), 2);
+        assert_eq!(runner.requests().len(), 3);
     }
 
     #[test]
@@ -2971,7 +3155,7 @@ mod tests {
         assert_eq!(runner.requests()[0].args.last().unwrap(), "--color=never");
     }
 
-    fn command_failure(stderr: &str) -> Result<ProcessOutput, ProcessRunError> {
+    pub(super) fn command_failure(stderr: &str) -> Result<ProcessOutput, ProcessRunError> {
         Ok(ProcessOutput {
             success: false,
             stdout: Vec::new(),
@@ -4402,6 +4586,47 @@ printf '%s\n' '[{"number":90,"title":"Host-resolved pull request","url":"https:/
         ] {
             assert_eq!(parse_git_remote(url), Some(expected), "remote: {url}");
         }
+    }
+
+    #[test]
+    fn remote_paths_keep_nested_groups() {
+        for (url, host, path) in [
+            (
+                "git@gitlab.com:group/sub/project.git",
+                "gitlab.com",
+                "group/sub/project",
+            ),
+            (
+                "ssh://git@GitLab.example.com:2222/group/sub/project.git",
+                "gitlab.example.com",
+                "group/sub/project",
+            ),
+            (
+                "https://user:secret@gitlab.com:8443/a/b/c/d/",
+                "gitlab.com",
+                "a/b/c/d",
+            ),
+            ("https://github.com/owner/repo", "github.com", "owner/repo"),
+        ] {
+            assert_eq!(
+                parse_git_remote_path(url),
+                Some((host.into(), path.into())),
+                "remote: {url}"
+            );
+        }
+        for url in [
+            "https://gitlab.com/project.git",
+            "https://gitlab.com/group//project",
+            "git://gitlab.com/group/project.git",
+            "/tmp/group/project",
+        ] {
+            assert_eq!(parse_git_remote_path(url), None, "remote: {url}");
+        }
+        // The owner/repo parse used by checkouts keeps its two segments.
+        assert_eq!(
+            parse_git_remote("git@gitlab.com:group/sub/project.git"),
+            None
+        );
     }
 
     #[test]
