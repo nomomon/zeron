@@ -12,7 +12,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use zeron_proto::{
-    ChangeRequestComment, ChangeRequestFilter, ChangeRequestPage, ChangeRequestScope,
+    ChangeRequestComment, ChangeRequestFilter, ChangeRequestListItem, ChangeRequestPage,
+    ChangeRequestPresentation, ChangeRequestScope,
 };
 
 use crate::change_request_store::ChangeRequestStore;
@@ -35,6 +36,15 @@ pub(crate) trait ChangeRequestBoardProvider: Send + Sync {
 
     /// Whether `url` names a change request this adapter can open.
     fn owns_url(&self, url: &str) -> bool;
+
+    /// How clients name and show this provider, sent with its pages and
+    /// details so no client has to know it.
+    fn presentation(&self) -> ChangeRequestPresentation;
+
+    /// Fill a row's presentation fields (its `reference`, avatars) from
+    /// what the row already says. Applied to every row served, stored ones
+    /// included, so rows stored by an older build read the same.
+    fn present(&self, _item: &mut ChangeRequestListItem) {}
 
     /// The signed-in account the on-disk store keys pages by, read locally.
     /// Each adapter namespaces its own keys. `None` when it can't be told,
@@ -164,8 +174,21 @@ impl ChangeRequestBoardProviders {
         // Rows name the adapter that listed them, whatever it wrote.
         for item in &mut page.items {
             item.provider = adapter.provider_id().into();
+            adapter.present(item);
         }
+        page.presentation = Some(adapter.presentation());
         Ok(page)
+    }
+
+    /// How clients present `scope`'s provider, for a board that has no page
+    /// to read it from (its first load failed).
+    pub(crate) fn presentation(
+        &self,
+        scope: &ChangeRequestScope,
+    ) -> Option<ChangeRequestPresentation> {
+        self.for_scope(scope)
+            .ok()
+            .map(|adapter| adapter.presentation())
     }
 
     pub(crate) async fn change_request(
@@ -176,9 +199,16 @@ impl ChangeRequestBoardProviders {
         head: Option<&str>,
         base: Option<&str>,
     ) -> Result<serde_json::Value, ChangeRequestError> {
-        self.for_url(url)?
+        let adapter = self.for_url(url)?;
+        let mut value = adapter
             .change_request(url, diff, refresh, head, base)
-            .await
+            .await?;
+        if let Some(detail) = value.as_object_mut().filter(|_| !diff) {
+            let presentation = serde_json::to_value(adapter.presentation())
+                .map_err(|_| ChangeRequestError::Decode)?;
+            detail.insert("presentation".into(), presentation);
+        }
+        Ok(value)
     }
 
     pub(crate) async fn post_comment(
@@ -238,7 +268,7 @@ pub(crate) mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use chrono::DateTime;
-    use zeron_proto::{ChangeRequestListItem, ChangeRequestMergeability, ChangeRequestState};
+    use zeron_proto::{ChangeRequestFeatures, ChangeRequestMergeability, ChangeRequestState};
 
     use super::*;
 
@@ -299,6 +329,7 @@ pub(crate) mod tests {
             mergeability: ChangeRequestMergeability::Unknown,
             created_at: DateTime::UNIX_EPOCH,
             updated_at: DateTime::UNIX_EPOCH,
+            reference: None,
         }
     }
 
@@ -325,6 +356,27 @@ pub(crate) mod tests {
                 .is_some_and(|(path, number)| {
                     self.scope("forge.test", path).is_some() && number.parse::<u64>().is_ok()
                 })
+        }
+
+        fn presentation(&self) -> ChangeRequestPresentation {
+            ChangeRequestPresentation {
+                provider_name: "Forge".into(),
+                cli_name: "Forge CLI".into(),
+                cli_command: "forge".into(),
+                sign_in_command: "forge login".into(),
+                noun: "change".into(),
+                media_hosts: vec!["forge.test".into()],
+                media_rewrites: Vec::new(),
+                features: ChangeRequestFeatures {
+                    native_detail: true,
+                    comments: false,
+                    handoff: false,
+                },
+            }
+        }
+
+        fn present(&self, item: &mut ChangeRequestListItem) {
+            item.reference = Some(format!("~{}", item.number));
         }
 
         async fn account_key(&self) -> Option<String> {
@@ -357,6 +409,7 @@ pub(crate) mod tests {
                 items,
                 next_cursor: None,
                 fetched_at: Some(chrono::Utc::now()),
+                presentation: None,
             })
         }
 
@@ -507,5 +560,42 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(page.items[0].url, "https://forge.test/team/app/-/changes/7");
         assert_eq!(forge.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn pages_and_details_carry_their_adapters_presentation() {
+        let (providers, _) = registry(Forge::new().with_repository("team/platform/app", &[7]));
+        let scope = providers.parse("forge.test/team/platform/app").unwrap();
+        let page = providers
+            .list_page(&scope, ChangeRequestFilter::All, None, false, false)
+            .await
+            .unwrap();
+        assert_eq!(page.items[0].reference.as_deref(), Some("~7"));
+        assert_eq!(page.items[0].provider, "forge");
+        let presentation = page.presentation.unwrap();
+        assert_eq!(presentation.provider_name, "Forge");
+        assert!(presentation.features.native_detail && !presentation.features.comments);
+        assert_eq!(providers.presentation(&scope), Some(presentation.clone()));
+        let github = providers.parse("acme/zeron").unwrap();
+        assert_eq!(
+            providers
+                .presentation(&github)
+                .map(|presentation| presentation.provider_name),
+            Some("GitHub".into())
+        );
+        let url = "https://forge.test/team/platform/app/-/changes/7";
+        let detail: zeron_proto::ChangeRequestDetail = serde_json::from_value(
+            providers
+                .change_request(url, false, false, None, None)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(detail.presentation, Some(presentation));
+        // A patch is text; it carries nothing else.
+        assert_eq!(
+            providers.change_request(url, true, false, None, None).await,
+            Ok(serde_json::Value::String(String::new()))
+        );
     }
 }

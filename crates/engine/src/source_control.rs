@@ -345,7 +345,11 @@ impl ChangeRequestResolver {
         {
             return Err(ChangeRequestError::UnsupportedRepository);
         }
-        self.github.find_for_branch(source).await
+        let mut change_request = self.github.find_for_branch(source).await?;
+        if let Some(summary) = &mut change_request {
+            summary.features = Some(self.github.presentation().features);
+        }
+        Ok(change_request)
     }
 }
 
@@ -570,8 +574,12 @@ impl GitHubCli {
                 .as_str()
                 .ok_or(ChangeRequestError::Decode)?
                 .into(),
-            author: zeron_proto::ChangeRequestActor {
-                login: value["user"]["login"].as_str().unwrap_or_default().into(),
+            author: {
+                let login = value["user"]["login"].as_str().unwrap_or_default();
+                zeron_proto::ChangeRequestActor {
+                    login: login.into(),
+                    avatar_url: github_avatar(login),
+                }
             },
             created_at: value["created_at"].as_str().unwrap_or_default().into(),
             ..Default::default()
@@ -678,6 +686,25 @@ impl GitHubCli {
                 }
             }
             detail.review_threads = self.fetch_review_threads(&url).await.ok();
+            let actors = std::iter::once(&mut detail.author)
+                .chain(
+                    detail
+                        .comments
+                        .iter_mut()
+                        .map(|comment| &mut comment.author),
+                )
+                .chain(detail.reviews.iter_mut().map(|review| &mut review.author))
+                .chain(
+                    detail
+                        .review_threads
+                        .iter_mut()
+                        .flatten()
+                        .flat_map(|thread| &mut thread.comments)
+                        .map(|comment| &mut comment.author),
+                );
+            for actor in actors {
+                actor.avatar_url = github_avatar(&actor.login);
+            }
             serde_json::to_value(detail).map_err(|_| ChangeRequestError::Decode)
         }
     }
@@ -1044,6 +1071,7 @@ impl GitHubCli {
                 next_cursor,
                 total_count: response.data.search.issue_count,
                 fetched_at: Some(Utc::now()),
+                presentation: None,
             },
             canonical,
         ))
@@ -1120,6 +1148,18 @@ impl GitHubCli {
             .map(|reference| reference.name)
             .filter(|name| !name.is_empty())
     }
+}
+
+/// GitHub redirects this public profile image endpoint to its avatar CDN.
+/// Stable sizing lets repeated authors share the client's image cache.
+fn github_avatar(login: &str) -> Option<String> {
+    if login.is_empty() {
+        return None;
+    }
+    let mut url = reqwest::Url::parse("https://github.com/").ok()?;
+    url.path_segments_mut().ok()?.push(&format!("{login}.png"));
+    url.set_query(Some("size=64"));
+    Some(url.to_string())
 }
 
 /// Board requests run against GitHub.com without a checkout or interactive prompts.
@@ -1207,6 +1247,39 @@ impl ChangeRequestBoardProvider for GitHubCli {
 
     fn owns_url(&self, url: &str) -> bool {
         validated_pull_request_url(url).is_ok()
+    }
+
+    fn presentation(&self) -> zeron_proto::ChangeRequestPresentation {
+        zeron_proto::ChangeRequestPresentation {
+            provider_name: "GitHub".into(),
+            cli_name: "GitHub CLI".into(),
+            cli_command: "gh".into(),
+            sign_in_command: "gh auth login".into(),
+            noun: "pull request".into(),
+            // GitHub serves these images itself.
+            media_hosts: vec![
+                GITHUB_HOST.into(),
+                ".githubusercontent.com".into(),
+                ".githubassets.com".into(),
+            ],
+            // The file viewer serves HTML; its raw image is on another host.
+            media_rewrites: vec![zeron_proto::ChangeRequestMediaRewrite {
+                host: GITHUB_HOST.into(),
+                after_segments: 2,
+                segment: "blob".into(),
+                raw_host: "raw.githubusercontent.com".into(),
+            }],
+            features: zeron_proto::ChangeRequestFeatures {
+                native_detail: true,
+                comments: true,
+                handoff: true,
+            },
+        }
+    }
+
+    fn present(&self, item: &mut ChangeRequestListItem) {
+        item.reference = Some(format!("#{}", item.number));
+        item.author.avatar_url = github_avatar(&item.author.login);
     }
 
     /// Bare `gh` logins, as stores written before other providers keyed them.
@@ -1990,6 +2063,8 @@ fn to_summary(
         state: pull_request.state.into(),
         base_ref: pull_request.base_ref_name,
         head_ref: pull_request.head_ref_name,
+        reference: Some(format!("#{}", pull_request.number)),
+        features: None,
     })
 }
 
@@ -2046,6 +2121,7 @@ fn to_list_item(
         mergeability: pull_request.mergeable.into(),
         created_at: pull_request.created_at,
         updated_at: pull_request.updated_at,
+        reference: None,
     })
 }
 
@@ -2523,6 +2599,30 @@ mod tests {
         assert_eq!(first.items[0].number, 123);
         assert_eq!(first.items[0].repository, "acme/zeron");
         assert_eq!(first.total_count, Some(2));
+        // Presentation travels with the rows, and alone for a failed board.
+        assert_eq!(first.items[0].reference.as_deref(), Some("#123"));
+        assert_eq!(
+            first.items[0].author.avatar_url.as_deref(),
+            Some("https://github.com/octocat.png?size=64")
+        );
+        let presentation = first.presentation.clone().unwrap();
+        assert_eq!(presentation.sign_in_command, "gh auth login");
+        let described: Option<zeron_proto::ChangeRequestPresentation> = client
+            .call_as(
+                methods::DESCRIBE_CHANGE_REQUEST_SCOPE,
+                json!({"repository": "acme/zeron"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(described, Some(presentation.clone()));
+        let unserved: Option<zeron_proto::ChangeRequestPresentation> = client
+            .call_as(
+                methods::DESCRIBE_CHANGE_REQUEST_SCOPE,
+                json!({"repository": "other.test/team/app"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unserved, None);
         let second: ChangeRequestPage = client.call_as(methods::LIST_CHANGE_REQUEST_PAGE,
             json!({"repository": repository, "filter": "reviewing", "after": first.next_cursor})).await.unwrap();
         assert_eq!(second.items[0].number, 124);
@@ -2535,6 +2635,7 @@ mod tests {
                 .unwrap();
             assert_eq!(loaded.title, "Add dashboard");
             assert_eq!(loaded.number, 123);
+            assert_eq!(loaded.presentation.as_ref(), Some(&presentation));
             assert!(loaded.author.login.is_empty());
             assert!(loaded.comments.is_empty());
             assert_eq!(loaded.head_ref_oid, head);
