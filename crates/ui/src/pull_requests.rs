@@ -1022,6 +1022,20 @@ impl PullRequestsPage {
             .as_deref()
             .unwrap_or(&engine.engine_info().device_id);
         let target = (device != local).then(|| device.clone());
+        // An engine that predates GitLab reports no repository for a GitLab
+        // remote, so its "none" can't be taken at its word.
+        let missing = if state.device_supports(
+            &device,
+            zeron_proto::capabilities::CHANGE_REQUESTS_GITLAB_V1,
+        ) {
+            "This project has no GitHub or GitLab remote. Enter a repository to open it directly."
+                .to_owned()
+        } else {
+            format!(
+                "This project has no GitHub remote, and {} needs a Zeron update to read GitLab remotes.",
+                selected_device_name(state, Some(&device))
+            )
+        };
         let project = ProjectRef { path, device };
         let mut params = params_for_target(target.as_deref());
         params["cwd"] = project.path.clone().into();
@@ -1039,12 +1053,12 @@ impl PullRequestsPage {
             let repository = match futures::future::select(request, deadline).await {
                 futures::future::Either::Left((Ok(value), _)) => {
                     serde_json::from_value::<Option<String>>(value)
-                        .map_err(|_| "The device returned an unreadable repository. Try again.")
+                        .map_err(|_| "The device returned an unreadable repository. Try again.".to_owned())
                         .and_then(|repo| repo.filter(|repo| valid_repository_filter(repo))
-                            .ok_or("This project has no GitHub or GitLab remote. Enter a repository to open it directly."))
+                            .ok_or(missing))
                 }
-                futures::future::Either::Left((Err(_), _)) => Err("Couldn’t read this project’s repository. Check the device connection and try again."),
-                futures::future::Either::Right(_) => Err("Repository detection timed out. Try again or enter owner/repository."),
+                futures::future::Either::Left((Err(_), _)) => Err("Couldn’t read this project’s repository. Check the device connection and try again.".to_owned()),
+                futures::future::Either::Right(_) => Err("Repository detection timed out. Try again or enter owner/repository.".to_owned()),
             };
             let _ = this.update(cx, |page, cx| {
                 if page.resolving_project.as_ref() != Some(&project) {
@@ -4218,7 +4232,12 @@ mod tests {
             page.repository = Some("owner/current".into());
             page.load_state = PullRequestsLoadState::Ready;
             state.update(cx, |state, _| {
-                state.set_test_engine(crate::state::EngineHandle::from_test_client(rpc.client()));
+                state.set_test_engine(
+                    crate::state::EngineHandle::from_test_client(rpc.client())
+                        .with_test_capabilities(&[
+                            zeron_proto::capabilities::CHANGE_REQUESTS_GITLAB_V1,
+                        ]),
+                );
                 state.local_device_id = Some("local".into());
                 state.spaces = vec![
                     space("slow", "local", true, 1),
@@ -5511,11 +5530,7 @@ mod tests {
         for (value, github, gitlab) in [
             ("owner/repo", true, false),
             ("gitlab.com/group/project", false, true),
-            (
-                "gitlab.com/acme/platform/team/api",
-                false,
-                true,
-            ),
+            ("gitlab.com/acme/platform/team/api", false, true),
             ("git.example.org/a/b", false, true),
             // A host has a dot; github.com repositories travel bare.
             ("owner/repo/extra", false, false),
@@ -5622,6 +5637,61 @@ mod tests {
                 });
                 assert!(calls.lock().unwrap().is_empty());
             }
+        }
+    }
+
+    #[gpui::test]
+    fn projects_on_engines_without_gitlab_say_why_nothing_was_found(cx: &mut gpui::TestAppContext) {
+        let runtime = fixture::runtime();
+        let _guard = runtime.enter();
+        let _settings = fixture::settings(cx, crate::settings::UiSettings::default());
+        // An engine that predates GitLab finds no repository behind a GitLab
+        // remote; one that supports GitLab finds none because there is none.
+        let rpc = ScriptedRpc::new(|method, _| async move {
+            assert_eq!(method, methods::GET_CHANGE_REQUEST_REPOSITORY);
+            zeron_rpc::RpcReply::value(&None::<String>)
+        });
+        let client = rpc.client();
+        let (page, cx) = cx.add_window_view(|_, cx| {
+            let engine = crate::state::EngineHandle::from_test_client(client);
+            let state = cx.new(|_| {
+                let mut state = AppState::new();
+                state.set_test_engine(engine);
+                state.local_device_id = Some("local".into());
+                let mut older = device("older", "macos");
+                older.name = "Studio Mac".into();
+                older.last_seen_at = Some(Utc::now());
+                let mut current = device("current", "macos");
+                current.last_seen_at = Some(Utc::now());
+                current
+                    .capabilities
+                    .push(zeron_proto::capabilities::CHANGE_REQUESTS_GITLAB_V1.into());
+                state.devices = vec![older, current];
+                state
+            });
+            PullRequestsPage::new(state, cx)
+        });
+        for (device, expected) in [
+            (
+                "older",
+                "Studio Mac needs a Zeron update to read GitLab remotes",
+            ),
+            ("current", "This project has no GitHub or GitLab remote"),
+        ] {
+            let before = rpc.completed();
+            page.update(cx, |page, cx| {
+                page.select_project("/api".into(), device.into(), cx)
+            });
+            rpc.settle(cx, &runtime, |cx| {
+                rpc.completed() > before
+                    && page.read_with(cx, |page, _| page.resolving_project.is_none())
+            });
+            page.read_with(cx, |page, cx| {
+                let messages = crate::toast::messages(cx);
+                let last = messages.last().expect("a toast explains the miss");
+                assert!(last.contains(expected), "{device}: {last}");
+                assert!(page.repository.is_none());
+            });
         }
     }
 }
