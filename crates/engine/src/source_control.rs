@@ -1000,7 +1000,7 @@ impl ChangeRequestBoardProvider for GitHubCli {
         validated_pull_request_url(url).ok()
     }
 
-    fn presentation(&self) -> zeron_proto::ChangeRequestPresentation {
+    fn presentation(&self, _host: &str) -> zeron_proto::ChangeRequestPresentation {
         zeron_proto::ChangeRequestPresentation {
             provider_name: "GitHub".into(),
             cli_name: "GitHub CLI".into(),
