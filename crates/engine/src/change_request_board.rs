@@ -19,6 +19,7 @@ use zeron_proto::{
 };
 
 use crate::change_request_store::ChangeRequestStore;
+use crate::source_control::gitlab::GitLabCli;
 use crate::source_control::{ChangeRequestError, CheckoutSourceContext, GitHubCli};
 
 /// What the board needs from one provider. Every method validates its own
@@ -251,7 +252,7 @@ impl ChangeRequestBoardProviders {
     /// The built-in adapters. Order settles hosts more than one adapter
     /// claims.
     fn built_in() -> Vec<Arc<dyn ChangeRequestBoardProvider>> {
-        vec![Arc::new(GitHubCli::new())]
+        vec![Arc::new(GitHubCli::new()), Arc::new(GitLabCli::new())]
     }
 
     /// The built-in adapters, keeping first pages in `data_dir`.
