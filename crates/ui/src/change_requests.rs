@@ -167,9 +167,13 @@ pub(crate) fn pull_request_list_badge(
     item: &ChangeRequestListItem,
     theme: &Theme,
 ) -> AnyElement {
+    let mut model = ChangeRequestBadgeModel::from_fields(item.number, &item.title, item.state);
+    if item.provider == "gitlab" {
+        model.number = crate::pull_requests::number_label(item).into();
+    }
     render_badge_model(
         id,
-        ChangeRequestBadgeModel::from_fields(item.number, &item.title, item.state),
+        model,
         item.url.clone(),
         ChangeRequestBadgeSurface::Sidebar,
         None,

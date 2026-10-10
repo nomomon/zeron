@@ -514,28 +514,32 @@ pub(super) fn render_description(
     output.into_any_element()
 }
 
-/// GitHub redirects this public profile image endpoint to its avatar CDN.
-/// Stable sizing lets repeated authors share GPUI's image cache.
-pub(super) fn avatar(login: &str, id: SharedString, size: f32, theme: &Theme) -> AnyElement {
+/// The login's initial in a circle: the GitHub avatar's placeholder, and the
+/// whole avatar for accounts that aren't GitHub's.
+pub(super) fn initial_avatar(login: &str, size: f32, theme: &Theme) -> AnyElement {
     let initial = login
         .chars()
         .next()
         .map(|c| c.to_uppercase().to_string())
         .unwrap_or_else(|| "?".into());
-    let fallback_theme = theme.clone();
-    let fallback = move || {
-        div()
-            .size(px(size))
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded_full()
-            .bg(fallback_theme.glass_hover())
-            .text_color(fallback_theme.text_muted)
-            .text_size(px(size * 0.5))
-            .child(initial.clone())
-            .into_any_element()
-    };
+    div()
+        .size(px(size))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_full()
+        .bg(theme.glass_hover())
+        .text_color(theme.text_muted)
+        .text_size(px(size * 0.5))
+        .child(initial)
+        .into_any_element()
+}
+
+/// GitHub redirects this public profile image endpoint to its avatar CDN.
+/// Stable sizing lets repeated authors share GPUI's image cache.
+pub(super) fn avatar(login: &str, id: SharedString, size: f32, theme: &Theme) -> AnyElement {
+    let (fallback_login, fallback_theme) = (login.to_owned(), theme.clone());
+    let fallback = move || initial_avatar(&fallback_login, size, &fallback_theme);
     if login.is_empty() {
         return fallback();
     }

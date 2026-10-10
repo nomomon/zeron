@@ -186,10 +186,10 @@ fn request_color(item: &ChangeRequestListItem, theme: &Theme) -> gpui::Hsla {
 
 fn matches_query(item: &ChangeRequestListItem, query: &str) -> bool {
     let text = format!(
-        "{} {} #{} {} {}",
+        "{} {} {} {} {}",
         item.title,
         item.repository,
-        item.number,
+        number_label(item),
         status_description(item),
         item.author.login
     )
@@ -866,8 +866,16 @@ impl PullRequestsPage {
             .text()
             .trim()
             .to_ascii_lowercase();
+        // github.com repositories travel bare.
+        let repository = match repository.strip_prefix("github.com/") {
+            Some(bare) if valid_github_repository(bare) => bare.to_owned(),
+            _ => repository,
+        };
         if !valid_repository_filter(&repository) {
-            crate::toast::error(cx, "Enter a repository as owner/name.");
+            crate::toast::error(
+                cx,
+                "Enter a repository as owner/name, or host/group/project for GitLab.",
+            );
             cx.notify();
             return;
         }
@@ -1033,7 +1041,7 @@ impl PullRequestsPage {
                     serde_json::from_value::<Option<String>>(value)
                         .map_err(|_| "The device returned an unreadable repository. Try again.")
                         .and_then(|repo| repo.filter(|repo| valid_repository_filter(repo))
-                            .ok_or("This project has no GitHub remote. Enter owner/repository to open it directly."))
+                            .ok_or("This project has no GitHub or GitLab remote. Enter a repository to open it directly."))
                 }
                 futures::future::Either::Left((Err(_), _)) => Err("Couldn’t read this project’s repository. Check the device connection and try again."),
                 futures::future::Either::Right(_) => Err("Repository detection timed out. Try again or enter owner/repository."),
@@ -1621,6 +1629,13 @@ impl PullRequestsPage {
             cx.notify();
             return;
         }
+        // Older engines read every repository as GitHub's owner/repo.
+        if self.on_gitlab() && !self.target_supports_gitlab(&engine, cx) {
+            self.load_state =
+                PullRequestsLoadState::Failed(PullRequestsPageError::UpdateRequired(target_name));
+            cx.notify();
+            return;
+        }
 
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
@@ -1719,6 +1734,19 @@ impl PullRequestsPage {
         cx.notify();
     }
 
+    /// The board shows a GitLab project's merge requests.
+    fn on_gitlab(&self) -> bool {
+        self.repository.as_deref().is_some_and(is_gitlab_scope)
+    }
+
+    fn target_supports_gitlab(&self, engine: &crate::state::EngineHandle, cx: &gpui::App) -> bool {
+        let capability = zeron_proto::capabilities::CHANGE_REQUESTS_GITLAB_V1;
+        match self.target_device.as_deref() {
+            Some(target) => self.state.read(cx).device_supports(target, capability),
+            None => engine.engine_info().supports(capability),
+        }
+    }
+
     fn store_snapshot(&mut self, at: Instant) {
         let Some(repository) = self.repository.clone() else {
             return;
@@ -1748,7 +1776,7 @@ impl PullRequestsPage {
         }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             self.more_error = Some(PullRequestsPageError::Network);
-            toast_page_error(&PullRequestsPageError::Network, None, cx);
+            toast_page_error(&PullRequestsPageError::Network, self.on_gitlab(), None, cx);
             cx.notify();
             return;
         };
@@ -1786,7 +1814,7 @@ impl PullRequestsPage {
                     }
                     Err(error) => {
                         let error = map_rpc_error(&error, &target_name);
-                        toast_page_error(&error, None, cx);
+                        toast_page_error(&error, page.on_gitlab(), None, cx);
                         page.more_error = Some(error);
                     }
                 }
@@ -2027,10 +2055,10 @@ impl PullRequestsPage {
             _ => icons::PULL_REQUEST,
         };
         let (title, body) = match &self.load_state {
-            PullRequestsLoadState::Failed(error) => error_copy(error),
+            PullRequestsLoadState::Failed(error) => error_copy(error, self.on_gitlab()),
             _ if self.repository.is_none() => (
                 "Choose a repository".into(),
-                "No GitHub repository was found for this project. Choose one to load your open pull requests.".into(),
+                "No GitHub or GitLab repository was found for this project. Choose one to load your open pull requests.".into(),
             ),
             PullRequestsLoadState::Idle => (
                 "Ready when you are".into(),
@@ -2260,8 +2288,9 @@ impl Render for PullRequestsPage {
         if refresh_error && !self.refresh_error_shown {
             if let PullRequestsLoadState::Failed(error) = &self.load_state {
                 let error = error.clone();
+                let gitlab = self.on_gitlab();
                 cx.defer(move |cx| {
-                    toast_page_error(&error, Some("Showing the last loaded results."), cx)
+                    toast_page_error(&error, gitlab, Some("Showing the last loaded results."), cx)
                 });
             }
         }
@@ -2931,6 +2960,15 @@ fn pull_request_key(item: &ChangeRequestListItem) -> String {
     format!("{}#{}", item.repository, item.number)
 }
 
+/// GitLab names merge requests `!iid`; pull requests are `#number`.
+pub(crate) fn number_label(item: &ChangeRequestListItem) -> String {
+    if item.provider == "gitlab" {
+        format!("!{}", item.number)
+    } else {
+        format!("#{}", item.number)
+    }
+}
+
 pub(crate) fn table_row_shell(
     layout: PullRequestTableLayout,
     first: bool,
@@ -2975,10 +3013,10 @@ fn render_table_row(
         .debug_selector(|| "pull-request-row".to_string())
         .role(gpui::Role::Link)
         .aria_label(format!(
-            "{}: {} #{}. {}. Open pull request",
+            "{}: {} {}. {}. Open pull request",
             item.title,
             item.repository,
-            item.number,
+            number_label(item),
             status_description(item)
         ))
         .tab_index(0)
@@ -3144,12 +3182,22 @@ fn render_pr_identity(item: &ChangeRequestListItem, theme: &Theme) -> AnyElement
                         .gap(px(5.0))
                         .min_w_0()
                         .max_w(px(150.0))
-                        .child(super::pull_request_media::avatar(
-                            &item.author.login,
-                            format!("pr-list-author-{}", pull_request_key(item)).into(),
-                            16.0,
-                            theme,
-                        ))
+                        // Logins name GitHub accounts; a GitLab user of the same
+                        // name may be someone else, so it shows the initial.
+                        .child(if item.provider == "github" {
+                            super::pull_request_media::avatar(
+                                &item.author.login,
+                                format!("pr-list-author-{}", pull_request_key(item)).into(),
+                                16.0,
+                                theme,
+                            )
+                        } else {
+                            super::pull_request_media::initial_avatar(
+                                &item.author.login,
+                                16.0,
+                                theme,
+                            )
+                        })
                         .child(
                             div()
                                 .min_w_0()
@@ -3415,8 +3463,13 @@ fn repository_menu_label(theme: &Theme, label: &str) -> gpui::Div {
 }
 
 /// A page-level failure as a toast: its title and explanation.
-fn toast_page_error(error: &PullRequestsPageError, suffix: Option<&str>, cx: &mut gpui::App) {
-    let (title, body) = error_copy(error);
+fn toast_page_error(
+    error: &PullRequestsPageError,
+    gitlab: bool,
+    suffix: Option<&str>,
+    cx: &mut gpui::App,
+) {
+    let (title, body) = error_copy(error, gitlab);
     let message = match suffix {
         Some(suffix) => format!("{title}. {body} {suffix}"),
         None => format!("{title}. {body}"),
@@ -3424,17 +3477,42 @@ fn toast_page_error(error: &PullRequestsPageError, suffix: Option<&str>, cx: &mu
     crate::toast::error(cx, message);
 }
 
+/// A board scope: a bare `owner/repo` on github.com, or a GitLab project
+/// qualified by its host (`gitlab.com/group/.../project`), which only engines
+/// advertising `change-requests-gitlab-v1` accept.
 fn valid_repository_filter(value: &str) -> bool {
+    valid_github_repository(value) || is_gitlab_scope(value)
+}
+
+fn valid_github_repository(value: &str) -> bool {
     let parts: Vec<_> = value.split('/').collect();
-    parts.len() == 2
-        && parts.iter().all(|part| {
-            !part.is_empty()
-                && *part != "."
-                && *part != ".."
-                && part
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
-        })
+    parts.len() == 2 && parts.iter().all(|part| valid_path_segment(part))
+}
+
+/// A host with a dot, then a project under at least one group. The dot keeps
+/// it apart from `owner/repo`.
+fn is_gitlab_scope(value: &str) -> bool {
+    let Some((host, path)) = value.split_once('/') else {
+        return false;
+    };
+    let parts: Vec<_> = path.split('/').collect();
+    host.contains('.')
+        && !host.eq_ignore_ascii_case("github.com")
+        && !host.starts_with(['-', '.'])
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-.".contains(&b))
+        && (2..=21).contains(&parts.len())
+        && parts.iter().all(|part| valid_path_segment(part))
+}
+
+fn valid_path_segment(part: &str) -> bool {
+    !part.is_empty()
+        && part != "."
+        && part != ".."
+        && part
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
 }
 
 fn params_for_target(target: Option<&str>) -> serde_json::Value {
@@ -3475,8 +3553,25 @@ fn map_rpc_error(error: &RpcError, target_name: &str) -> PullRequestsPageError {
     }
 }
 
-fn error_copy(error: &PullRequestsPageError) -> (String, String) {
+/// What a failure says, naming GitLab's CLI and sign-in on a GitLab board.
+fn error_copy(error: &PullRequestsPageError, gitlab: bool) -> (String, String) {
     match error {
+        PullRequestsPageError::CliUnavailable if gitlab => (
+            "GitLab CLI isn’t available on this device".into(),
+            "Install glab and sign in to view your merge requests.".into(),
+        ),
+        PullRequestsPageError::Authentication if gitlab => (
+            "Sign in to GitLab on this device".into(),
+            "Run glab auth login, then refresh this page.".into(),
+        ),
+        PullRequestsPageError::RateLimited if gitlab => (
+            "GitLab’s rate limit was reached".into(),
+            "Requests are paused for 15 minutes. Your loaded results stay available.".into(),
+        ),
+        PullRequestsPageError::UpdateRequired(name) if gitlab => (
+            format!("Update Zeron on {name}"),
+            "This device doesn’t support GitLab merge requests yet.".into(),
+        ),
         PullRequestsPageError::CliUnavailable => (
             "GitHub CLI isn’t available on this device".into(),
             "Install gh and sign in to view your pull requests.".into(),
@@ -4238,7 +4333,7 @@ mod tests {
             assert!(
                 crate::toast::messages(cx)
                     .iter()
-                    .any(|message| message.contains("no GitHub remote"))
+                    .any(|message| message.contains("no GitHub or GitLab remote"))
             );
             assert_eq!(page.repository.as_deref(), Some("owner/next"));
         });
@@ -5409,5 +5504,124 @@ mod tests {
             assert_eq!(page.items.len(), 50, "the late Reviewing reply is ignored");
             assert_eq!(page.load_state, PullRequestsLoadState::Ready);
         });
+    }
+
+    #[test]
+    fn repository_scopes_accept_host_qualified_gitlab_projects() {
+        for (value, github, gitlab) in [
+            ("owner/repo", true, false),
+            ("gitlab.com/group/project", false, true),
+            (
+                "gitlab.com/acme/platform/team/api",
+                false,
+                true,
+            ),
+            ("git.example.org/a/b", false, true),
+            // A host has a dot; github.com repositories travel bare.
+            ("owner/repo/extra", false, false),
+            ("github.com/owner/repo", false, false),
+            // Two segments are always GitHub's owner/repo.
+            ("gitlab.com/project", true, false),
+            ("gitlab.com/group/../project", false, false),
+            ("-gitlab.com/group/project", false, false),
+            ("gitlab.com:22/group/project", false, false),
+            ("", false, false),
+        ] {
+            assert_eq!(valid_github_repository(value), github, "{value}");
+            assert_eq!(is_gitlab_scope(value), gitlab, "{value}");
+            assert_eq!(valid_repository_filter(value), github || gitlab, "{value}");
+        }
+        let mut item = pull_request("gitlab.com/group/project", 441, 1, 1, 1);
+        assert_eq!(number_label(&item), "#441");
+        item.provider = "gitlab".into();
+        assert_eq!(number_label(&item), "!441");
+        assert!(matches_query(&item, "!441"));
+        assert_eq!(
+            error_copy(&PullRequestsPageError::Authentication, true).1,
+            "Run glab auth login, then refresh this page."
+        );
+        assert_eq!(
+            error_copy(&PullRequestsPageError::Authentication, false).1,
+            "Run gh auth login, then refresh this page."
+        );
+    }
+
+    #[gpui::test]
+    fn gitlab_projects_load_only_from_engines_that_support_them(cx: &mut gpui::TestAppContext) {
+        let runtime = fixture::runtime();
+        let _guard = runtime.enter();
+        let _settings = fixture::settings(cx, crate::settings::UiSettings::default());
+        let wire = "gitlab.com/acme/platform/team/api";
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = calls.clone();
+        let rpc = ScriptedRpc::new(move |method, params| {
+            let recorded = recorded.clone();
+            async move {
+                assert_eq!(method, methods::LIST_CHANGE_REQUEST_PAGE);
+                let repository = params["repository"].as_str().unwrap().to_owned();
+                recorded.lock().unwrap().push(repository.clone());
+                let mut item = pull_request(&repository, 441, 1, 1, 1);
+                item.provider = "gitlab".into();
+                item.url = format!("https://{repository}/-/merge_requests/441");
+                zeron_rpc::RpcReply::value(&ChangeRequestPage {
+                    items: vec![item],
+                    next_cursor: None,
+                    total_count: Some(1),
+                    fetched_at: None,
+                })
+            }
+        });
+        for supported in [false, true] {
+            let client = rpc.client();
+            let (page, cx) = cx.add_window_view(|_, cx| {
+                let engine = crate::state::EngineHandle::from_test_client(client);
+                let engine = if supported {
+                    engine.with_test_capabilities(&[
+                        zeron_proto::capabilities::CHANGE_REQUESTS_GITLAB_V1,
+                    ])
+                } else {
+                    engine
+                };
+                let state = cx.new(|_| {
+                    let mut state = AppState::new();
+                    state.set_test_engine(engine);
+                    state
+                });
+                PullRequestsPage::new(state, cx)
+            });
+            page.update(cx, |page, cx| {
+                page.repository_input
+                    .update(cx, |input, cx| input.set_text(wire.to_uppercase(), cx));
+                page.select_repository(cx);
+            });
+            if supported {
+                settle(
+                    cx,
+                    &runtime,
+                    |page| page.load_state == PullRequestsLoadState::Ready,
+                    &page,
+                    &rpc,
+                );
+                page.read_with(cx, |page, _| {
+                    assert_eq!(page.repository.as_deref(), Some(wire));
+                    assert_eq!(page.items[0].number, 441);
+                    assert_eq!(request_group(&page.items[0]), PullRequestGroup::Review);
+                });
+                assert_eq!(*calls.lock().unwrap(), [wire]);
+            } else {
+                cx.run_until_parked();
+                page.read_with(cx, |page, _| {
+                    assert_eq!(page.repository.as_deref(), Some(wire));
+                    let PullRequestsLoadState::Failed(error) = &page.load_state else {
+                        panic!("an older engine must not be asked");
+                    };
+                    assert_eq!(
+                        error_copy(error, page.on_gitlab()).1,
+                        "This device doesn’t support GitLab merge requests yet."
+                    );
+                });
+                assert!(calls.lock().unwrap().is_empty());
+            }
+        }
     }
 }
