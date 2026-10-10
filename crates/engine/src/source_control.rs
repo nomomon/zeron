@@ -119,31 +119,20 @@ pub struct ChangeRequestResolution {
 pub enum ChangeRequestError {
     #[error("Git repository context is unavailable")]
     RepositoryUnavailable,
-    #[error("GitHub is unavailable for this repository")]
+    #[error("no change request provider serves this repository")]
     UnsupportedRepository,
-    #[error("GitHub CLI is not installed")]
+    #[error("the provider's CLI is not installed")]
     CliUnavailable,
-    #[error("GitHub CLI is not authenticated for this host")]
+    #[error("the provider's CLI is not authenticated for this host")]
     Authentication,
-    #[error("GitHub API rate limit reached")]
+    #[error("the provider's rate limit was reached")]
     RateLimited,
-    #[error("GitHub request timed out")]
+    #[error("the provider request timed out")]
     Timeout,
-    #[error("GitHub returned an invalid response")]
+    #[error("the provider returned an invalid response")]
     Decode,
-    #[error("GitHub request failed")]
+    #[error("the provider request failed")]
     CommandFailed,
-}
-
-/// Provider boundary shared by the checkout badge and future source-control views.
-#[async_trait]
-pub trait ChangeRequestProvider: Send + Sync {
-    fn provider(&self) -> &'static str;
-
-    async fn find_for_branch(
-        &self,
-        source: &CheckoutSourceContext,
-    ) -> Result<Option<ChangeRequestSummary>, ChangeRequestError>;
 }
 
 /// Checkout inspection plus provider resolution, injectable for cache/service tests.
@@ -154,37 +143,53 @@ pub trait CheckoutChangeRequestLookup: Send + Sync {
         cwd: &Path,
     ) -> Result<CheckoutSourceContext, ChangeRequestError>;
 
-    async fn resolve_github_source(
+    /// The change request for an inspected checkout's branch. `None` when
+    /// there is none, or no adapter can look one up for its remote.
+    async fn resolve_source(
         &self,
         source: &CheckoutSourceContext,
     ) -> Result<Option<ChangeRequestSummary>, ChangeRequestError>;
 }
 
 /// Host-side resolver. All subprocesses run on the device that owns `cwd`.
+/// Provider calls go through the board's registry, so the per-chat badge and
+/// the board share its adapters and caches.
 #[derive(Clone)]
 pub struct ChangeRequestResolver {
     inspector: GitCheckoutInspector,
-    github: GitHubCli,
+    providers: ChangeRequestBoardProviders,
 }
 
 impl ChangeRequestResolver {
+    /// The built-in adapters, keeping nothing on disk.
     pub fn new() -> Self {
-        let runner: Arc<dyn ProcessRunner> = Arc::new(SystemProcessRunner);
+        Self::with_providers(ChangeRequestBoardProviders::without_store())
+    }
+
+    pub(crate) fn with_providers(providers: ChangeRequestBoardProviders) -> Self {
         Self {
-            inspector: GitCheckoutInspector::new(runner.clone()),
-            github: GitHubCli::with_runner(runner),
+            inspector: GitCheckoutInspector::new(Arc::new(SystemProcessRunner)),
+            providers,
         }
+    }
+
+    /// The board's registry this resolver routes through.
+    pub(crate) fn providers(&self) -> &ChangeRequestBoardProviders {
+        &self.providers
+    }
+
+    /// Board calls reach `github` alone, with nothing stored on disk.
+    #[cfg(test)]
+    pub(crate) fn with_github(mut self, github: GitHubCli) -> Self {
+        self.providers = ChangeRequestBoardProviders::for_tests(vec![Arc::new(github)], None);
+        self
     }
 
     /// Resolve just the selected checkout's identity. Local only: no provider
     /// lookup, repository enumeration, or remote transport. The path is the
     /// remote's as written, which may predate a repository rename; the board
     /// adopts the provider's canonical name once its first page loads.
-    pub(crate) async fn scope_for_checkout(
-        &self,
-        cwd: &Path,
-        providers: &ChangeRequestBoardProviders,
-    ) -> Option<ChangeRequestScope> {
+    pub(crate) async fn scope_for_checkout(&self, cwd: &Path) -> Option<ChangeRequestScope> {
         let remote_url = match self.inspect_checkout(cwd).await {
             Ok(source) => source.branch.remote_url?,
             // An unborn or detached checkout still has a useful origin.
@@ -194,7 +199,7 @@ impl ChangeRequestResolver {
                     .await?
             }
         };
-        self.remote_scope(&remote_url, providers).await
+        self.remote_scope(&remote_url).await
     }
 
     /// Match a PR's repository against every fetch remote. A fork's origin
@@ -207,7 +212,6 @@ impl ChangeRequestResolver {
         &self,
         cwd: &Path,
         wanted: &ChangeRequestScope,
-        providers: &ChangeRequestBoardProviders,
     ) -> Option<ChangeRequestScope> {
         let remotes = self.inspector.git_optional(cwd, &["remote"]).await?;
         let mut scopes = Vec::new();
@@ -220,7 +224,7 @@ impl ChangeRequestResolver {
                 continue;
             };
             for url in urls.lines() {
-                if let Some(scope) = self.remote_scope(url, providers).await {
+                if let Some(scope) = self.remote_scope(url).await {
                     if scope.same_repository(wanted) {
                         return Some(scope);
                     }
@@ -236,7 +240,7 @@ impl ChangeRequestResolver {
             }
         }
         for scope in scopes {
-            if let Some(canonical) = providers.canonical_scope(&scope).await
+            if let Some(canonical) = self.providers.canonical_scope(&scope).await
                 && canonical.same_repository(wanted)
             {
                 return Some(canonical);
@@ -247,15 +251,11 @@ impl ChangeRequestResolver {
 
     /// The board scope for a remote: its host and whole path, read once,
     /// then accepted (or not) by the adapter serving that host.
-    async fn remote_scope(
-        &self,
-        remote_url: &str,
-        providers: &ChangeRequestBoardProviders,
-    ) -> Option<ChangeRequestScope> {
+    async fn remote_scope(&self, remote_url: &str) -> Option<ChangeRequestScope> {
         let (host, path) = self
-            .remote_repository(remote_url, |host| providers.serves_host(host))
+            .remote_repository(remote_url, |host| self.providers.serves_host(host))
             .await?;
-        providers.scope(&host, &path)
+        self.providers.scope(&host, &path)
     }
 
     /// The host and whole repository path of a remote on a host `served`
@@ -297,12 +297,9 @@ impl ChangeRequestResolver {
             .map(|host| (host.to_ascii_lowercase(), path))
     }
 
-    pub async fn resolve_github(
-        &self,
-        cwd: &Path,
-    ) -> Result<ChangeRequestResolution, ChangeRequestError> {
+    pub async fn resolve(&self, cwd: &Path) -> Result<ChangeRequestResolution, ChangeRequestError> {
         let source = self.inspect_checkout(cwd).await?;
-        let change_request = self.resolve_github_source(&source).await?;
+        let change_request = self.resolve_source(&source).await?;
         Ok(ChangeRequestResolution {
             source,
             change_request,
@@ -317,22 +314,20 @@ impl ChangeRequestResolver {
         self.inspector.inspect(cwd).await
     }
 
-    /// Resolve an already-inspected checkout without repeating Git subprocesses.
-    pub async fn resolve_github_source(
+    /// Resolve an already-inspected checkout without repeating Git
+    /// subprocesses. A remote no adapter serves, or one whose adapter can't
+    /// look up branches, has no change request: no badge, not a failure.
+    pub async fn resolve_source(
         &self,
         source: &CheckoutSourceContext,
     ) -> Result<Option<ChangeRequestSummary>, ChangeRequestError> {
-        if source.branch.host.is_none()
-            || source.branch.owner.is_none()
-            || source.branch.repository.is_none()
-        {
-            return Err(ChangeRequestError::UnsupportedRepository);
-        }
-        let mut change_request = self.github.find_for_branch(source).await?;
-        if let Some(summary) = &mut change_request {
-            summary.features = Some(self.github.presentation().features);
-        }
-        Ok(change_request)
+        let Some(remote_url) = source.branch.remote_url.as_deref() else {
+            return Ok(None);
+        };
+        let Some(scope) = self.remote_scope(remote_url).await else {
+            return Ok(None);
+        };
+        self.providers.find_for_branch(&scope, source).await
     }
 }
 
@@ -351,11 +346,11 @@ impl CheckoutChangeRequestLookup for ChangeRequestResolver {
         ChangeRequestResolver::inspect_checkout(self, cwd).await
     }
 
-    async fn resolve_github_source(
+    async fn resolve_source(
         &self,
         source: &CheckoutSourceContext,
     ) -> Result<Option<ChangeRequestSummary>, ChangeRequestError> {
-        ChangeRequestResolver::resolve_github_source(self, source).await
+        ChangeRequestResolver::resolve_source(self, source).await
     }
 }
 
@@ -983,49 +978,6 @@ impl Default for GitHubCli {
     }
 }
 
-#[async_trait]
-impl ChangeRequestProvider for GitHubCli {
-    fn provider(&self) -> &'static str {
-        "github"
-    }
-
-    async fn find_for_branch(
-        &self,
-        source: &CheckoutSourceContext,
-    ) -> Result<Option<ChangeRequestSummary>, ChangeRequestError> {
-        if source.branch.host.is_none()
-            || source.branch.owner.is_none()
-            || source.branch.repository.is_none()
-        {
-            return Err(ChangeRequestError::UnsupportedRepository);
-        }
-        if source.branch.head_selectors.is_empty() {
-            return Ok(None);
-        }
-
-        for selector in &source.branch.head_selectors {
-            let candidates = self.list_for_selector(source, selector).await?;
-            if candidates.is_empty() {
-                continue;
-            }
-            let default_branch = match source.default_branch.clone() {
-                Some(branch) => Some(branch),
-                None if needs_default_branch(source, &candidates) => {
-                    self.default_branch(source).await
-                }
-                None => None,
-            };
-            return select_pull_request(
-                self.provider(),
-                source,
-                default_branch.as_deref(),
-                candidates,
-            );
-        }
-        Ok(None)
-    }
-}
-
 /// The board's github.com adapter. Enterprise hosts open in the browser.
 #[async_trait]
 impl ChangeRequestBoardProvider for GitHubCli {
@@ -1130,6 +1082,45 @@ impl ChangeRequestBoardProvider for GitHubCli {
     ) -> Result<zeron_proto::ChangeRequestComment, ChangeRequestError> {
         GitHubCli::post_comment(self, url, body).await
     }
+
+    /// The branch's pull request, open ones first, through `gh pr list` in
+    /// the checkout. A historical one on the default branch is no answer.
+    async fn find_for_branch(
+        &self,
+        _scope: &ChangeRequestScope,
+        source: &CheckoutSourceContext,
+    ) -> Result<Option<ChangeRequestSummary>, ChangeRequestError> {
+        if source.branch.host.is_none()
+            || source.branch.owner.is_none()
+            || source.branch.repository.is_none()
+        {
+            return Err(ChangeRequestError::UnsupportedRepository);
+        }
+        if source.branch.head_selectors.is_empty() {
+            return Ok(None);
+        }
+
+        for selector in &source.branch.head_selectors {
+            let candidates = self.list_for_selector(source, selector).await?;
+            if candidates.is_empty() {
+                continue;
+            }
+            let default_branch = match source.default_branch.clone() {
+                Some(branch) => Some(branch),
+                None if needs_default_branch(source, &candidates) => {
+                    self.default_branch(source).await
+                }
+                None => None,
+            };
+            return select_pull_request(
+                GITHUB_PROVIDER,
+                source,
+                default_branch.as_deref(),
+                candidates,
+            );
+        }
+        Ok(None)
+    }
 }
 
 impl BranchHeadContext {
@@ -1146,7 +1137,20 @@ impl BranchHeadContext {
             .map(str::to_owned)
             .or_else(|| upstream_ref.as_deref().and_then(remote_from_upstream));
         let remote_url = non_empty(remote_url).map(str::to_owned);
-        let parsed_remote = remote_url.as_deref().and_then(parse_git_remote);
+        // The whole path, nested groups included; the owner is its first
+        // segment and the repository the rest. Which provider names it,
+        // and how, is the board registry's to say.
+        let parsed_remote = remote_url
+            .as_deref()
+            .and_then(parse_git_remote_path)
+            .and_then(|(host, path)| {
+                let (owner, repository) = path.split_once('/')?;
+                Some(GitRemote {
+                    host,
+                    owner: owner.to_owned(),
+                    repository: repository.to_owned(),
+                })
+            });
         let upstream_branch = upstream_ref
             .as_deref()
             .and_then(|upstream| branch_from_upstream(upstream, remote_name.as_deref()));
@@ -2736,16 +2740,13 @@ mod tests {
         )]);
         let resolver = ChangeRequestResolver {
             inspector: GitCheckoutInspector::new(runner.clone()),
-            github: GitHubCli::with_runner(runner.clone()),
+            providers: board(runner.clone()),
         };
-        let dir = tempfile::tempdir().unwrap();
-        let providers = ChangeRequestBoardProviders::new(dir.path())
-            .with_adapter(Arc::new(GitHubCli::with_runner(runner.clone())));
         let slug = |remote: &'static str| {
-            let (resolver, providers) = (&resolver, &providers);
+            let resolver = &resolver;
             async move {
                 resolver
-                    .remote_scope(remote, providers)
+                    .remote_scope(remote)
                     .await
                     .map(|scope| scope.to_string())
             }
@@ -2774,11 +2775,8 @@ mod tests {
         ]);
         let resolver = ChangeRequestResolver {
             inspector: GitCheckoutInspector::new(runner.clone()),
-            github: GitHubCli::with_runner(runner.clone()),
+            providers: board(runner.clone()),
         };
-        let dir = tempfile::tempdir().unwrap();
-        let providers = ChangeRequestBoardProviders::new(dir.path())
-            .with_adapter(Arc::new(GitHubCli::with_runner(runner.clone())));
         let github = ChangeRequestScope::parse("acme/zeron");
         for remote in [
             "https://github.com/acme/zeron.git",
@@ -2786,21 +2784,13 @@ mod tests {
             // The alias's real host names the scope, never the alias.
             "git@github-work:acme/zeron.git",
         ] {
-            assert_eq!(
-                resolver.remote_scope(remote, &providers).await,
-                github,
-                "{remote}"
-            );
+            assert_eq!(resolver.remote_scope(remote).await, github, "{remote}");
         }
         for remote in [
             "https://gitlab.com/acme/zeron.git",
             "git@gitlab-work:acme/zeron.git",
         ] {
-            assert_eq!(
-                resolver.remote_scope(remote, &providers).await,
-                None,
-                "{remote}"
-            );
+            assert_eq!(resolver.remote_scope(remote).await, None, "{remote}");
         }
         assert_eq!(runner.requests().len(), 2);
     }
@@ -3155,6 +3145,20 @@ mod tests {
         (result, runner)
     }
 
+    /// The scope a branch's remote names, as the registry routes it.
+    fn branch_scope(source: &CheckoutSourceContext) -> ChangeRequestScope {
+        let branch = &source.branch;
+        ChangeRequestScope::new(
+            branch.host.as_deref().unwrap(),
+            &format!(
+                "{}/{}",
+                branch.owner.as_deref().unwrap(),
+                branch.repository.as_deref().unwrap()
+            ),
+        )
+        .unwrap()
+    }
+
     async fn resolve_with(
         source: &CheckoutSourceContext,
         response: Result<ProcessOutput, ProcessRunError>,
@@ -3164,7 +3168,7 @@ mod tests {
     ) {
         let runner = FakeProcessRunner::with_responses([response]);
         let github = GitHubCli::with_runner(runner.clone());
-        let result = github.find_for_branch(source).await;
+        let result = github.find_for_branch(&branch_scope(source), source).await;
         (result, runner)
     }
 
@@ -3931,11 +3935,11 @@ printf '%s\n' '[{"number":90,"title":"Host-resolved pull request","url":"https:/
         });
         let resolver = ChangeRequestResolver {
             inspector: GitCheckoutInspector::new(runner.clone()),
-            github: GitHubCli::with_runner(runner),
+            providers: board(runner),
         };
 
         let resolution = resolver
-            .resolve_github(&checkout)
+            .resolve(&checkout)
             .await
             .expect("host resolves fake GitHub pull request");
 
@@ -4152,7 +4156,11 @@ printf '%s\n' '[{"number":90,"title":"Host-resolved pull request","url":"https:/
         ]);
         let github = GitHubCli::with_runner(runner.clone());
 
-        let result = github.find_for_branch(&source).await.unwrap().unwrap();
+        let result = github
+            .find_for_branch(&branch_scope(&source), &source)
+            .await
+            .unwrap()
+            .unwrap();
 
         assert_eq!(result.number, 100);
         let requests = runner.requests();
@@ -4197,7 +4205,9 @@ printf '%s\n' '[{"number":90,"title":"Host-resolved pull request","url":"https:/
         })]);
         let github = GitHubCli::with_runner(runner);
 
-        let result = github.find_for_branch(&source).await;
+        let result = github
+            .find_for_branch(&branch_scope(&source), &source)
+            .await;
 
         assert_eq!(result.unwrap_err(), ChangeRequestError::Decode);
     }
@@ -4284,7 +4294,9 @@ printf '%s\n' '[{"number":90,"title":"Host-resolved pull request","url":"https:/
         ]);
         let github = GitHubCli::with_runner(runner.clone());
 
-        let result = github.find_for_branch(&source).await;
+        let result = github
+            .find_for_branch(&branch_scope(&source), &source)
+            .await;
 
         assert_eq!(result.unwrap(), None, "historical PR on main is suppressed");
         let requests = runner.requests();
@@ -4338,7 +4350,9 @@ printf '%s\n' '[{"number":90,"title":"Host-resolved pull request","url":"https:/
         ]);
         let github = GitHubCli::with_runner(runner);
 
-        let result = github.find_for_branch(&source).await;
+        let result = github
+            .find_for_branch(&branch_scope(&source), &source)
+            .await;
 
         assert_eq!(result.unwrap().unwrap().number, 99);
     }

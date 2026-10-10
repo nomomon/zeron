@@ -15,11 +15,11 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use zeron_proto::{
     ChangeRequestComment, ChangeRequestFilter, ChangeRequestListItem, ChangeRequestPage,
-    ChangeRequestPresentation, ChangeRequestScope,
+    ChangeRequestPresentation, ChangeRequestScope, ChangeRequestSummary,
 };
 
 use crate::change_request_store::ChangeRequestStore;
-use crate::source_control::{ChangeRequestError, GitHubCli};
+use crate::source_control::{ChangeRequestError, CheckoutSourceContext, GitHubCli};
 
 /// What the board needs from one provider. Every method validates its own
 /// inputs before they reach a CLI, whatever the caller already checked.
@@ -86,6 +86,16 @@ pub(crate) trait ChangeRequestBoardProvider: Send + Sync {
         url: &str,
         body: &str,
     ) -> Result<ChangeRequestComment, ChangeRequestError>;
+
+    /// The change request for `source`'s branch in `scope`, for the
+    /// per-chat badge. An adapter that can't look branches up shows none.
+    async fn find_for_branch(
+        &self,
+        _scope: &ChangeRequestScope,
+        _source: &CheckoutSourceContext,
+    ) -> Result<Option<ChangeRequestSummary>, ChangeRequestError> {
+        Ok(None)
+    }
 }
 
 /// Page cursors are short opaque tokens. Anything else is rejected before
@@ -244,6 +254,11 @@ impl ChangeRequestBoardProviders {
             vec![Arc::new(GitHubCli::new())],
             Some(ChangeRequestStore::new(data_dir)),
         )
+    }
+
+    /// The built-in adapters, keeping nothing on disk.
+    pub(crate) fn without_store() -> Self {
+        Self::with_adapters(vec![Arc::new(GitHubCli::new())], None)
     }
 
     fn with_adapters(
@@ -469,6 +484,25 @@ impl ChangeRequestBoardProviders {
         Ok(value)
     }
 
+    /// The change request for `source`'s branch in `scope`, stamped with
+    /// its adapter and features. A scope no adapter names has none. Not
+    /// cached here: the badge service keeps its own pace.
+    pub(crate) async fn find_for_branch(
+        &self,
+        scope: &ChangeRequestScope,
+        source: &CheckoutSourceContext,
+    ) -> Result<Option<ChangeRequestSummary>, ChangeRequestError> {
+        let Ok(registered) = self.for_scope(scope) else {
+            return Ok(None);
+        };
+        let mut found = registered.adapter.find_for_branch(scope, source).await?;
+        if let Some(summary) = &mut found {
+            summary.provider = registered.adapter.provider_id().into();
+            summary.features = Some(registered.adapter.presentation().features);
+        }
+        Ok(found)
+    }
+
     /// Post once; never retried. The cached detail is dropped whatever the
     /// outcome: a write may have landed even when its reply failed.
     pub(crate) async fn post_comment(
@@ -677,6 +711,30 @@ pub(crate) mod tests {
                 viewer_did_author: true,
                 ..Default::default()
             })
+        }
+
+        /// The newest change request in the scope, whatever the branch.
+        async fn find_for_branch(
+            &self,
+            scope: &ChangeRequestScope,
+            source: &CheckoutSourceContext,
+        ) -> Result<Option<ChangeRequestSummary>, ChangeRequestError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let repositories = self.repositories.lock().unwrap();
+            Ok(repositories
+                .get(&scope.path().to_ascii_lowercase())
+                .and_then(|items| items.first())
+                .map(|item| ChangeRequestSummary {
+                    provider: String::new(),
+                    number: item.number,
+                    title: item.title.clone(),
+                    url: item.url.clone(),
+                    state: item.state,
+                    base_ref: "main".into(),
+                    head_ref: source.branch.head_branch.clone(),
+                    reference: Some(format!("~{}", item.number)),
+                    features: None,
+                }))
         }
     }
 
@@ -936,6 +994,49 @@ pub(crate) mod tests {
                 .entries
                 .iter()
                 .any(|entry| entry.0 == "false:https://forge.test/team/platform/app/-/changes/7::")
+        );
+    }
+
+    #[tokio::test]
+    async fn branch_badges_route_through_the_registry_like_the_board() {
+        use crate::source_control::{BranchHeadContext, ChangeRequestResolver};
+        let (providers, forge) = registry(Forge::new().with_repository("team/platform/app", &[7]));
+        let resolver = ChangeRequestResolver::with_providers(providers);
+        let source = |remote: &str| CheckoutSourceContext {
+            checkout_root: "/checkout".into(),
+            branch: BranchHeadContext::resolve(
+                "feature/change",
+                Some("origin/feature/change"),
+                Some("origin"),
+                Some(remote),
+            ),
+            default_branch: Some("main".into()),
+        };
+        // A nested project's remote keeps its whole path and reaches the
+        // forge, which stamps nothing itself: the registry names it.
+        let nested = source("git@forge.test:team/platform/app.git");
+        assert_eq!(nested.branch.repository.as_deref(), Some("platform/app"));
+        let summary = resolver.resolve_source(&nested).await.unwrap().unwrap();
+        assert_eq!(summary.provider, "forge");
+        assert_eq!(summary.reference.as_deref(), Some("~7"));
+        assert_eq!(summary.head_ref, "feature/change");
+        assert!(summary.features.unwrap().native_detail);
+        assert_eq!(forge.calls(), 1);
+        // A host no adapter serves, or a path the forge refuses, has no
+        // badge: not an error to back off from.
+        for remote in [
+            "https://other.test/team/app.git",
+            "https://forge.test/a/b/c/d/e/f.git",
+        ] {
+            assert_eq!(resolver.resolve_source(&source(remote)).await, Ok(None));
+        }
+        assert_eq!(forge.calls(), 1);
+        // A served provider's failure still is one.
+        assert_eq!(
+            resolver
+                .resolve_source(&source("https://github.com/acme/zeron.git"))
+                .await,
+            Err(ChangeRequestError::CliUnavailable)
         );
     }
 }

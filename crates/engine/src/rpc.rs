@@ -80,7 +80,7 @@ use crate::project_actions::ProjectActionsStore;
 use crate::registry::HarnessRegistry;
 use crate::repos::{Repos, session_home_dir};
 use crate::sessions::SessionsEngine;
-use crate::source_control::ChangeRequestError;
+use crate::source_control::{ChangeRequestError, ChangeRequestResolver};
 use crate::terminals::Terminals;
 use crate::uploads::Uploads;
 use crate::workspace_host::WorkspaceHost;
@@ -626,7 +626,9 @@ pub struct EngineRpc {
     project_actions: ProjectActionsStore,
     previews: Option<zeron_preview::PreviewService>,
     change_requests: CheckoutChangeRequests,
-    board_providers: ChangeRequestBoardProviders,
+    /// Board calls and checkout remotes, through the registry the per-chat
+    /// badge shares.
+    change_request_resolver: ChangeRequestResolver,
     diff_sync: CheckoutDiffSync,
     uploads: Uploads,
     agent_accounts: AgentAccounts,
@@ -650,6 +652,7 @@ impl EngineRpc {
         terminals: Terminals,
         project_actions: ProjectActionsStore,
         change_requests: CheckoutChangeRequests,
+        change_request_resolver: ChangeRequestResolver,
         diff_sync: CheckoutDiffSync,
         uploads: Uploads,
         agent_accounts: AgentAccounts,
@@ -661,7 +664,6 @@ impl EngineRpc {
             cursor_sdk_version: Some(zeron_harness::CursorHarness::sdk_version().into()),
             capabilities: zeron_proto::capabilities::current(),
         };
-        let board_providers = ChangeRequestBoardProviders::new(repos.data_dir());
         Self {
             voice: sessions.voice_manager(),
             sessions,
@@ -674,7 +676,7 @@ impl EngineRpc {
             project_actions,
             previews: None,
             change_requests,
-            board_providers,
+            change_request_resolver,
             diff_sync,
             uploads,
             agent_accounts,
@@ -729,9 +731,12 @@ impl EngineRpc {
     /// without.
     #[cfg(test)]
     pub(crate) fn with_github(mut self, github: crate::source_control::GitHubCli) -> Self {
-        self.board_providers =
-            ChangeRequestBoardProviders::for_tests(vec![std::sync::Arc::new(github)], None);
+        self.change_request_resolver = self.change_request_resolver.with_github(github);
         self
+    }
+
+    fn board(&self) -> &ChangeRequestBoardProviders {
+        self.change_request_resolver.providers()
     }
 
     fn auth(&self) -> Result<&Auth, RpcError> {
@@ -2588,21 +2593,13 @@ impl RpcService for EngineRpc {
                 // never probes arbitrary directories for their remotes.
                 let cwd = self.change_request_root(&p.cwd).await?;
                 let cwd = cwd.as_path();
-                let resolver = crate::source_control::ChangeRequestResolver::new();
+                let resolver = &self.change_request_resolver;
                 let scope = match p.repository {
-                    Some(repository) => match self.board_providers.parse(&repository) {
-                        Some(wanted) => {
-                            resolver
-                                .matching_scope_for_checkout(cwd, &wanted, &self.board_providers)
-                                .await
-                        }
+                    Some(repository) => match self.board().parse(&repository) {
+                        Some(wanted) => resolver.matching_scope_for_checkout(cwd, &wanted).await,
                         None => None,
                     },
-                    None => {
-                        resolver
-                            .scope_for_checkout(cwd, &self.board_providers)
-                            .await
-                    }
+                    None => resolver.scope_for_checkout(cwd).await,
                 };
                 RpcReply::value(&scope.map(|scope| scope.to_string()))
             }
@@ -2621,7 +2618,7 @@ impl RpcService for EngineRpc {
                     cached: bool,
                 }
                 let p: P = parse_params(params)?;
-                let Some(scope) = self.board_providers.parse(&p.repository) else {
+                let Some(scope) = self.board().parse(&p.repository) else {
                     return Err(RpcError::BadParams(
                         "repository must be owner/repo or host/path".into(),
                     ));
@@ -2633,7 +2630,7 @@ impl RpcService for EngineRpc {
                     return Err(RpcError::BadParams("invalid page cursor".into()));
                 }
                 let page = self
-                    .board_providers
+                    .board()
                     .list_page(&scope, p.filter, p.after.as_deref(), p.refresh, p.cached)
                     .await
                     .map_err(change_request_rpc_error)?;
@@ -2646,9 +2643,9 @@ impl RpcService for EngineRpc {
                 }
                 let p: P = parse_params(params)?;
                 let presentation = self
-                    .board_providers
+                    .board()
                     .parse(&p.repository)
-                    .and_then(|scope| self.board_providers.presentation(&scope));
+                    .and_then(|scope| self.board().presentation(&scope));
                 RpcReply::value(&presentation)
             }
             methods::POST_CHANGE_REQUEST_COMMENT => {
@@ -2664,7 +2661,7 @@ impl RpcService for EngineRpc {
                     ));
                 }
                 let comment = self
-                    .board_providers
+                    .board()
                     .post_comment(&p.url, &p.body)
                     .await
                     .map_err(change_request_rpc_error)?;
@@ -2684,7 +2681,7 @@ impl RpcService for EngineRpc {
                 }
                 let p: P = parse_params(params)?;
                 let value = self
-                    .board_providers
+                    .board()
                     .change_request(
                         &p.url,
                         method == methods::GET_CHANGE_REQUEST_DIFF,
