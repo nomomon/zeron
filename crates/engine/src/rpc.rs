@@ -72,6 +72,7 @@ use zeron_rpc::{
 
 use crate::agent_accounts::AgentAccounts;
 use crate::auth::Auth;
+use crate::change_request_board::{ChangeRequestBoardProviders, ChangeRequestScope};
 use crate::change_requests::CheckoutChangeRequests;
 use crate::diff_sync::CheckoutDiffSync;
 use crate::doc_host::DocHost;
@@ -79,7 +80,7 @@ use crate::project_actions::ProjectActionsStore;
 use crate::registry::HarnessRegistry;
 use crate::repos::{Repos, session_home_dir};
 use crate::sessions::SessionsEngine;
-use crate::source_control::{ChangeRequestError, GitHubCli};
+use crate::source_control::ChangeRequestError;
 use crate::terminals::Terminals;
 use crate::uploads::Uploads;
 use crate::workspace_host::WorkspaceHost;
@@ -625,7 +626,7 @@ pub struct EngineRpc {
     project_actions: ProjectActionsStore,
     previews: Option<zeron_preview::PreviewService>,
     change_requests: CheckoutChangeRequests,
-    github: GitHubCli,
+    board_providers: ChangeRequestBoardProviders,
     diff_sync: CheckoutDiffSync,
     uploads: Uploads,
     agent_accounts: AgentAccounts,
@@ -660,7 +661,7 @@ impl EngineRpc {
             cursor_sdk_version: Some(zeron_harness::CursorHarness::sdk_version().into()),
             capabilities: zeron_proto::capabilities::current(),
         };
-        let github = GitHubCli::new().with_store(repos.data_dir());
+        let board_providers = ChangeRequestBoardProviders::new(repos.data_dir());
         Self {
             voice: sessions.voice_manager(),
             sessions,
@@ -673,7 +674,7 @@ impl EngineRpc {
             project_actions,
             previews: None,
             change_requests,
-            github,
+            board_providers,
             diff_sync,
             uploads,
             agent_accounts,
@@ -724,8 +725,8 @@ impl EngineRpc {
     }
 
     #[cfg(test)]
-    pub(crate) fn with_github(mut self, github: GitHubCli) -> Self {
-        self.github = github;
+    pub(crate) fn with_github(mut self, github: crate::source_control::GitHubCli) -> Self {
+        self.board_providers = self.board_providers.with_github(github);
         self
     }
 
@@ -2583,15 +2584,22 @@ impl RpcService for EngineRpc {
                 let cwd = self.change_request_root(&p.cwd).await?;
                 let cwd = cwd.as_path();
                 let resolver = crate::source_control::ChangeRequestResolver::new();
-                let repository = match p.repository {
-                    Some(repository) => {
+                let scope = match p.repository {
+                    Some(repository) => match ChangeRequestScope::from_wire(&repository) {
+                        Some(wanted) => {
+                            resolver
+                                .matching_scope_for_checkout(cwd, &wanted, &self.board_providers)
+                                .await
+                        }
+                        None => None,
+                    },
+                    None => {
                         resolver
-                            .matching_repository_for_checkout(cwd, &repository, &self.github)
+                            .scope_for_checkout(cwd, &self.board_providers)
                             .await
                     }
-                    None => resolver.repository_for_checkout(cwd).await,
                 };
-                RpcReply::value(&repository)
+                RpcReply::value(&scope.map(|scope| scope.to_wire()))
             }
             methods::LIST_CHANGE_REQUEST_PAGE => {
                 #[derive(Deserialize)]
@@ -2608,9 +2616,9 @@ impl RpcService for EngineRpc {
                     cached: bool,
                 }
                 let p: P = parse_params(params)?;
-                if !crate::source_control::valid_pr_repository(&p.repository) {
+                let Some(scope) = ChangeRequestScope::from_wire(&p.repository) else {
                     return Err(RpcError::BadParams("repository must be owner/repo".into()));
-                }
+                };
                 if p.after
                     .as_deref()
                     .is_some_and(|cursor| !crate::source_control::valid_page_cursor(cursor))
@@ -2618,14 +2626,8 @@ impl RpcService for EngineRpc {
                     return Err(RpcError::BadParams("invalid page cursor".into()));
                 }
                 let page = self
-                    .github
-                    .list_page(
-                        &p.repository,
-                        p.filter,
-                        p.after.as_deref(),
-                        p.refresh,
-                        p.cached,
-                    )
+                    .board_providers
+                    .list_page(&scope, p.filter, p.after.as_deref(), p.refresh, p.cached)
                     .await
                     .map_err(change_request_rpc_error)?;
                 RpcReply::value(&page)
@@ -2643,7 +2645,7 @@ impl RpcService for EngineRpc {
                     ));
                 }
                 let comment = self
-                    .github
+                    .board_providers
                     .post_comment(&p.url, &p.body)
                     .await
                     .map_err(change_request_rpc_error)?;
@@ -2663,8 +2665,8 @@ impl RpcService for EngineRpc {
                 }
                 let p: P = parse_params(params)?;
                 let value = self
-                    .github
-                    .detail_request(
+                    .board_providers
+                    .change_request(
                         &p.url,
                         method == methods::GET_CHANGE_REQUEST_DIFF,
                         p.refresh,
