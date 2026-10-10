@@ -1115,41 +1115,28 @@ impl PullRequestsPage {
                 "Choose repository".into()
             }
         });
-        let (projects, local, profile, selected_space) = {
+        let (projects, local, profile, selected_space, device, online) = {
             let state = self.state.read(cx);
             let local = state.local_device_id.clone().or_else(|| {
                 state
                     .engine()
                     .map(|engine| engine.engine_info().device_id.clone())
             });
-            let projects: Vec<_> = if self.repository_menu.get().is_some() {
-                state.projects()
+            let device = self
+                .target_device
+                .clone()
+                .or_else(|| local.clone())
+                .unwrap_or_default();
+            let projects = if self.repository_menu.get().is_some() {
+                picker_projects(state, &device)
             } else {
                 Vec::new()
-            }
-            .into_iter()
-            .filter_map(|members| {
-                let name = state
-                    .representative_space(members[0])
-                    .display_name()
-                    .to_owned();
-                let checkouts: Vec<_> = members
-                    .into_iter()
-                    .filter(|space| space.git_detected)
-                    .map(|space| {
-                        (
-                            space.clone(),
-                            state
-                                .device_name(&space.device_id)
-                                .unwrap_or("This device")
-                                .to_owned(),
-                            state.device_online(&space.device_id, Utc::now()),
-                        )
-                    })
-                    .collect();
-                (!checkouts.is_empty()).then_some((name, checkouts))
-            })
-            .collect();
+            };
+            let online = state.device_online(&device, Utc::now());
+            let device = state
+                .device_name(&device)
+                .unwrap_or("This device")
+                .to_owned();
             let profile = match &state.auth {
                 Some(zeron_proto::AuthState::SignedIn { user, org_id }) => {
                     Some(format!("{}:{org_id:?}", user.id))
@@ -1170,7 +1157,7 @@ impl PullRequestsPage {
                         )
                 })
                 .cloned();
-            (projects, local, profile, selected_space)
+            (projects, local, profile, selected_space, device, online)
         };
         let trigger_icon = match selected_space.as_ref() {
             Some(space) => div()
@@ -1243,7 +1230,7 @@ impl PullRequestsPage {
                     !projects
                         .iter()
                         .flat_map(|(_, members)| members)
-                        .any(|(space, _, _)| {
+                        .any(|(space, _)| {
                             let project = ProjectRef {
                                 path: space.path.clone(),
                                 device: space.device_id.clone(),
@@ -1263,8 +1250,7 @@ impl PullRequestsPage {
             if !projects.is_empty() {
                 options.push(popover::menu_heading(theme, "Projects").into_any_element());
                 for (name, members) in projects {
-                    let multiple = members.len() > 1;
-                    for (space, device, online) in members {
+                    for (space, path) in members {
                         let project = ProjectRef {
                             path: space.path.clone(),
                             device: space.device_id.clone(),
@@ -1273,10 +1259,8 @@ impl PullRequestsPage {
                         let loading = self.resolving_project.as_ref() == Some(&project);
                         let detail: Option<SharedString> = if loading {
                             Some("Finding repository…".into())
-                        } else if multiple {
-                            Some(device.clone().into())
                         } else {
-                            None
+                            path.map(SharedString::from)
                         };
                         let artwork = self.project_icons.render(
                             &self.state,
@@ -3537,6 +3521,39 @@ fn recent_git_projects(state: &AppState, local: &str) -> Vec<ProjectRef> {
         .collect()
 }
 
+/// The repository picker's projects on `device`, the board's device: each
+/// project (one per repository across devices, [`AppState::projects`]) by
+/// its checkouts there, with their paths when it has several. A project
+/// with none there is left out, as the composer's device chip lists only
+/// devices holding the picked project: detection, and every page after it,
+/// runs on the board's device, so a checkout elsewhere could only fail or
+/// silently move the board to a device the user didn't pick.
+fn picker_projects(
+    state: &AppState,
+    device: &str,
+) -> Vec<(String, Vec<(zeron_proto::Space, Option<String>)>)> {
+    state
+        .projects()
+        .into_iter()
+        .filter_map(|members| {
+            let name = state
+                .representative_space(members[0])
+                .display_name()
+                .to_owned();
+            let here: Vec<_> = members
+                .into_iter()
+                .filter(|space| space.device_id == device && space.git_detected)
+                .collect();
+            let several = here.len() > 1;
+            let checkouts: Vec<_> = here
+                .into_iter()
+                .map(|space| (space.clone(), several.then(|| space.path.clone())))
+                .collect();
+            (!checkouts.is_empty()).then_some((name, checkouts))
+        })
+        .collect()
+}
+
 fn repository_menu_label(theme: &Theme, label: &str) -> gpui::Div {
     widgets::section_label(theme, label.to_owned())
         .py(px(4.0))
@@ -3924,6 +3941,51 @@ mod tests {
             ],
             "session activity first, this device before others, Git only"
         );
+    }
+
+    #[test]
+    fn the_repository_picker_offers_each_projects_checkout_on_the_boards_device() {
+        let mut state = AppState::new();
+        state.local_device_id = Some("local".into());
+        let shared = |id: &str, device: &str| {
+            let mut space = space(id, device, true, 1);
+            space.repository_id = Some("commit:shared".into());
+            space
+        };
+        state.spaces = vec![
+            shared("shared-local", "local"),
+            shared("shared-remote", "remote"),
+            shared("shared-remote-worktree", "remote"),
+            space("local-only", "local", true, 1),
+            space("remote-only", "remote", true, 1),
+            space("notes", "local", false, 1),
+        ];
+        let rows = |device: &str| {
+            picker_projects(&state, device)
+                .into_iter()
+                .flat_map(|(_, members)| members)
+                .map(|(space, detail)| (space.id, detail))
+                .collect::<Vec<_>>()
+        };
+        // A project lists its checkout on the board's device; one with
+        // none there is left out, and a project without Git is no row.
+        assert_eq!(
+            rows("local"),
+            [("local-only".into(), None), ("shared-local".into(), None),]
+        );
+        // Several checkouts on one device say where each one lives.
+        assert_eq!(
+            rows("remote"),
+            [
+                ("remote-only".into(), None),
+                ("shared-remote".into(), Some("/shared-remote".into())),
+                (
+                    "shared-remote-worktree".into(),
+                    Some("/shared-remote-worktree".into())
+                ),
+            ]
+        );
+        assert!(rows("elsewhere").is_empty());
     }
 
     #[gpui::test]
@@ -4425,6 +4487,90 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(scroll.max_offset().y, px(0.0));
         assert_eq!(scroll.offset().y, px(0.0));
+    }
+
+    #[gpui::test]
+    fn the_repository_picker_detects_projects_on_the_boards_device(cx: &mut gpui::TestAppContext) {
+        let runtime = fixture::runtime();
+        let _guard = runtime.enter();
+        // The board was last on the remote device.
+        let _settings = fixture::settings(cx, {
+            let mut settings = crate::settings::UiSettings::default();
+            settings.last_pull_request_repository = Some("acme/other".into());
+            settings.last_pull_request_device = Some("remote".into());
+            settings
+        });
+        let detected = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let rpc = ScriptedRpc::new({
+            let detected = detected.clone();
+            move |method, params| {
+                let detected = detected.clone();
+                async move {
+                    match method.as_str() {
+                        methods::GET_CHANGE_REQUEST_REPOSITORY => {
+                            detected.lock().unwrap().push((
+                                params["cwd"].as_str().unwrap().to_owned(),
+                                params["targetDeviceId"].as_str().map(str::to_owned),
+                            ));
+                            zeron_rpc::RpcReply::value(&Some("acme/shared"))
+                        }
+                        methods::LIST_CHANGE_REQUEST_PAGE => {
+                            zeron_rpc::RpcReply::value(&ChangeRequestPage::default())
+                        }
+                        other => panic!("unexpected request {other}"),
+                    }
+                }
+            }
+        });
+        let (page, cx) = cx.add_window_view(|_, cx| {
+            let state = fixture::state(cx, Some(rpc.client()));
+            state.update(cx, |state, _| {
+                state.local_device_id = Some("local".into());
+                let shared = |id: &str, device: &str| {
+                    let mut space = space(id, device, true, 1);
+                    space.repository_id = Some("commit:shared".into());
+                    space
+                };
+                state.spaces = vec![
+                    shared("shared-local", "local"),
+                    shared("shared-remote", "remote"),
+                    space("local-only", "local", true, 1),
+                ];
+            });
+            PullRequestsPage::new(state, cx)
+        });
+        cx.simulate_resize(gpui::size(px(900.0), px(700.0)));
+        rpc.settle(cx, &runtime, |cx| {
+            page.read_with(cx, |page, _| {
+                page.load_state == PullRequestsLoadState::Ready
+            })
+        });
+        page.update(cx, |page, cx| {
+            assert_eq!(page.target_device.as_deref(), Some("remote"));
+            page.repository_menu.open(());
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("pr-project-shared-remote").is_some());
+        for absent in ["pr-project-shared-local", "pr-project-local-only"] {
+            assert!(cx.debug_bounds(absent).is_none(), "{absent}");
+        }
+        let bounds = cx.debug_bounds("pr-project-shared-remote").unwrap();
+        cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+        rpc.settle(cx, &runtime, |cx| {
+            page.read_with(cx, |page, _| {
+                page.repository.as_deref() == Some("acme/shared")
+                    && page.load_state == PullRequestsLoadState::Ready
+            })
+        });
+        assert_eq!(
+            *detected.lock().unwrap(),
+            [("/shared-remote".to_owned(), Some("remote".to_owned()))]
+        );
+        page.read_with(cx, |page, _| {
+            assert_eq!(page.target_device.as_deref(), Some("remote"));
+            assert_eq!(page.repository.as_deref(), Some("acme/shared"));
+        });
     }
 
     #[gpui::test]
