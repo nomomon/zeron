@@ -724,11 +724,13 @@ impl EngineRpc {
         self
     }
 
+    /// Board calls reach `github` alone, with nothing stored on disk, as
+    /// when the adapter owned the store and tests swapped it for one
+    /// without.
     #[cfg(test)]
     pub(crate) fn with_github(mut self, github: crate::source_control::GitHubCli) -> Self {
-        self.board_providers = self
-            .board_providers
-            .with_adapter(std::sync::Arc::new(github));
+        self.board_providers =
+            ChangeRequestBoardProviders::for_tests(vec![std::sync::Arc::new(github)], None);
         self
     }
 
@@ -2626,7 +2628,7 @@ impl RpcService for EngineRpc {
                 };
                 if p.after
                     .as_deref()
-                    .is_some_and(|cursor| !crate::source_control::valid_page_cursor(cursor))
+                    .is_some_and(|cursor| !crate::change_request_board::valid_page_cursor(cursor))
                 {
                     return Err(RpcError::BadParams("invalid page cursor".into()));
                 }
