@@ -739,6 +739,7 @@ impl ChangeRequestBoardProvider for GitLabCli {
             total_count: requests.count,
             fetched_at: Some(Utc::now()),
             presentation: None,
+            errors: Vec::new(),
         })
     }
 

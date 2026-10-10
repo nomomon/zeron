@@ -195,13 +195,19 @@ pub mod methods {
     /// Current pull request for one checkout, resolved on the checkout's host device.
     pub const WATCH_CHECKOUT_CHANGE_REQUEST: &str = "WatchCheckoutChangeRequest";
     /// One page of a repository's open pull requests (`filter`, `after`
-    /// cursor), with the total count.
+    /// cursor), with the total count. Engines advertising
+    /// `change-requests-multi-scope-v1` also take `repositories`, several
+    /// as one page.
     pub const LIST_CHANGE_REQUEST_PAGE: &str = "ListChangeRequestPage";
     /// How clients present a scope's provider, for a board whose first page
     /// failed. Engines advertising `change-requests-host-scopes-v1` answer.
     pub const DESCRIBE_CHANGE_REQUEST_SCOPE: &str = "DescribeChangeRequestScope";
     /// Resolve a selected checkout through local Git metadata only.
     pub const GET_CHANGE_REQUEST_REPOSITORY: &str = "GetChangeRequestRepository";
+    /// The repositories in a project folder: the folder's own when it is a
+    /// checkout, else each checkout directly inside it. Local Git metadata
+    /// only. Engines advertising `change-requests-multi-scope-v1` answer.
+    pub const GET_CHANGE_REQUEST_REPOSITORIES: &str = "GetChangeRequestRepositories";
     pub const GET_CHANGE_REQUEST: &str = "GetChangeRequest";
     pub const POST_CHANGE_REQUEST_COMMENT: &str = "PostChangeRequestComment";
     pub const GET_CHANGE_REQUEST_DIFF: &str = "GetChangeRequestDiff";

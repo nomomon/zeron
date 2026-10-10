@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use zeron_proto::{
     ChangeRequestComment, ChangeRequestFilter, ChangeRequestListItem, ChangeRequestPage,
-    ChangeRequestPresentation, ChangeRequestScope, ChangeRequestSummary,
+    ChangeRequestPresentation, ChangeRequestScope, ChangeRequestScopeError, ChangeRequestSummary,
 };
 
 use crate::change_request_store::ChangeRequestStore;
@@ -107,6 +107,46 @@ pub(crate) fn valid_page_cursor(cursor: &str) -> bool {
         && cursor
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"+/=_-:".contains(&b))
+}
+
+/// Repositories one combined page reads at most: as many as a project
+/// folder lists.
+pub(crate) const COMBINED_SCOPE_LIMIT: usize = crate::source_control::FOLDER_CHECKOUT_LIMIT;
+/// Repositories a combined page reads at once.
+const COMBINED_CONCURRENCY: usize = 8;
+/// A combined page answers within this, however slow one repository is.
+/// A read still running then reports a timeout and lands in the cache, so
+/// the next attempt finds it.
+const COMBINED_BUDGET: Duration = Duration::from_secs(25);
+/// A combined cursor carries one cursor per repository still going.
+const COMBINED_CURSOR_LIMIT: usize = 16 * 1024;
+
+/// The cursor continuing a combined page: each scope that has more, with
+/// its own cursor, as base64url JSON.
+fn encode_combined_cursor(cursors: &[(String, String)]) -> Option<String> {
+    use base64::Engine as _;
+    if cursors.is_empty() {
+        return None;
+    }
+    let json = serde_json::to_vec(cursors).ok()?;
+    Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json))
+}
+
+/// The scopes and cursors a combined cursor continues, when every cursor in
+/// it is one a provider could have written.
+fn decode_combined_cursor(cursor: &str) -> Option<Vec<(String, String)>> {
+    use base64::Engine as _;
+    if cursor.is_empty() || cursor.len() > COMBINED_CURSOR_LIMIT {
+        return None;
+    }
+    let json = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(cursor)
+        .ok()?;
+    let cursors: Vec<(String, String)> = serde_json::from_slice(&json).ok()?;
+    cursors
+        .iter()
+        .all(|(_, cursor)| valid_page_cursor(cursor))
+        .then_some(cursors)
 }
 
 type RequestResult = Result<serde_json::Value, ChangeRequestError>;
@@ -437,6 +477,130 @@ impl ChangeRequestBoardProviders {
         Ok(present(registered, scope, page))
     }
 
+    /// One page combining several repositories' open change requests, as
+    /// a project folder of checkouts shows them. Each repository is read
+    /// exactly as [`Self::list_page`] reads it alone, so the store, caches
+    /// and rate-limit pauses stay per repository; its rows are merged newest
+    /// update first, as each provider orders its own.
+    ///
+    /// `after` continues every repository that had more: each "load more"
+    /// reads the next page of each of them. A repository that fails leaves
+    /// the rest of the page standing and is named in its `errors`; a failed
+    /// continuation is tried again by the next. Only when nothing loaded
+    /// does the page fail, with the first repository's error. The first
+    /// page's total is the sum of every loaded repository's; later pages
+    /// report none, so a client keeps the first.
+    pub(crate) async fn list_combined_page(
+        &self,
+        scopes: &[ChangeRequestScope],
+        filter: ChangeRequestFilter,
+        after: Option<&str>,
+        refresh: bool,
+        cached: bool,
+    ) -> Result<ChangeRequestPage, ChangeRequestError> {
+        use futures::StreamExt;
+        let mut unique: Vec<&ChangeRequestScope> = Vec::new();
+        for scope in scopes {
+            if !unique.iter().any(|seen| seen.same_repository(scope)) {
+                unique.push(scope);
+            }
+        }
+        if unique.is_empty() || unique.len() > COMBINED_SCOPE_LIMIT {
+            return Err(ChangeRequestError::UnsupportedRepository);
+        }
+        let reads: Vec<(ChangeRequestScope, Option<String>)> = match after {
+            None => unique
+                .iter()
+                .map(|scope| ((*scope).clone(), None))
+                .collect(),
+            Some(cursor) => {
+                let cursors = decode_combined_cursor(cursor).ok_or(ChangeRequestError::Decode)?;
+                unique
+                    .iter()
+                    .filter_map(|scope| {
+                        let wire = scope.to_string();
+                        cursors
+                            .iter()
+                            .find(|(named, _)| named.eq_ignore_ascii_case(&wire))
+                            .map(|(_, cursor)| ((*scope).clone(), Some(cursor.clone())))
+                    })
+                    .collect()
+            }
+        };
+        if reads.is_empty() {
+            return Err(ChangeRequestError::Decode);
+        }
+        let deadline = tokio::time::Instant::now() + COMBINED_BUDGET;
+        let results: Vec<_> =
+            futures::stream::iter(reads.clone().into_iter().map(|(scope, cursor)| async move {
+                let first = cursor.is_none();
+                let read =
+                    self.list_page(&scope, filter, cursor.as_deref(), refresh, cached && first);
+                tokio::time::timeout_at(deadline, read)
+                    .await
+                    .unwrap_or(Err(ChangeRequestError::Timeout))
+            }))
+            .buffered(COMBINED_CONCURRENCY)
+            .collect()
+            .await;
+
+        let mut combined = ChangeRequestPage {
+            total_count: Some(0),
+            presentation: self.presentation(unique[0]),
+            ..Default::default()
+        };
+        let mut continuing = Vec::new();
+        let mut first_error = None;
+        for ((scope, cursor), result) in reads.iter().zip(results) {
+            match result {
+                Ok(page) => {
+                    combined.items.extend(page.items);
+                    if let Some(next) = page.next_cursor {
+                        continuing.push((scope.to_string(), next));
+                    }
+                    combined.total_count = combined
+                        .total_count
+                        .zip(page.total_count)
+                        .map(|(sum, total)| sum + total);
+                    // The oldest read speaks for the page, so a client
+                    // refreshes it once any part has aged.
+                    combined.fetched_at = match (combined.fetched_at, page.fetched_at) {
+                        (Some(oldest), Some(at)) => Some(oldest.min(at)),
+                        (oldest, at) => oldest.or(at),
+                    };
+                }
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                    if let Some(cursor) = cursor {
+                        continuing.push((scope.to_string(), cursor.clone()));
+                    }
+                    combined.errors.push(ChangeRequestScopeError {
+                        repository: scope.to_string(),
+                        code: error.code().into(),
+                    });
+                }
+            }
+        }
+        if let Some(error) = first_error.filter(|_| combined.errors.len() == reads.len()) {
+            return Err(error);
+        }
+        if after.is_some() {
+            combined.total_count = None;
+        }
+        // Newest update first, then the board's own tiebreaks.
+        combined.items.sort_by(|left, right| {
+            right
+                .updated_at
+                .cmp(&left.updated_at)
+                .then_with(|| left.repository.cmp(&right.repository))
+                .then_with(|| left.number.cmp(&right.number))
+        });
+        let mut seen = std::collections::HashSet::new();
+        combined.items.retain(|item| seen.insert(item.url.clone()));
+        combined.next_cursor = encode_combined_cursor(&continuing);
+        Ok(combined)
+    }
+
     /// How clients present `scope`'s provider, for a board that has no page
     /// to read it from (its first load failed).
     pub(crate) fn presentation(
@@ -558,6 +722,12 @@ pub(crate) mod tests {
     pub(crate) struct Forge {
         hosts: Vec<String>,
         repositories: Mutex<HashMap<String, Vec<ChangeRequestListItem>>>,
+        /// Rows per page; every row on one page when `None`.
+        page_size: Option<usize>,
+        /// Repositories whose listing fails as if signed out.
+        failing: Mutex<Vec<String>>,
+        /// Each listing asked for, as `path@cursor`.
+        listed: Mutex<Vec<String>>,
         pub(crate) calls: AtomicUsize,
     }
 
@@ -570,8 +740,35 @@ pub(crate) mod tests {
             Self {
                 hosts: hosts.iter().map(|host| (*host).to_owned()).collect(),
                 repositories: Default::default(),
+                page_size: None,
+                failing: Default::default(),
+                listed: Default::default(),
                 calls: AtomicUsize::new(0),
             }
+        }
+
+        /// List `size` rows a page, continuing with an offset cursor.
+        pub(crate) fn paged(mut self, size: usize) -> Self {
+            self.page_size = Some(size);
+            self
+        }
+
+        /// `items` as `path`'s open change requests, in this order.
+        pub(crate) fn with_items(self, path: &str, items: Vec<ChangeRequestListItem>) -> Self {
+            self.repositories
+                .lock()
+                .unwrap()
+                .insert(path.to_ascii_lowercase(), items);
+            self
+        }
+
+        pub(crate) fn set_failing(&self, paths: &[&str]) {
+            *self.failing.lock().unwrap() = paths.iter().map(|path| (*path).to_owned()).collect();
+        }
+
+        /// The listings asked for since the last call, as `path@cursor`.
+        pub(crate) fn take_listed(&self) -> Vec<String> {
+            std::mem::take(&mut *self.listed.lock().unwrap())
         }
 
         /// Open change requests `numbers` in `path`, newest first.
@@ -679,9 +876,23 @@ pub(crate) mod tests {
             &self,
             scope: &ChangeRequestScope,
             _filter: ChangeRequestFilter,
-            _after: Option<&str>,
+            after: Option<&str>,
         ) -> Result<ChangeRequestPage, ChangeRequestError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            self.listed.lock().unwrap().push(format!(
+                "{}@{}",
+                scope.path(),
+                after.unwrap_or_default()
+            ));
+            if self
+                .failing
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|path| path.eq_ignore_ascii_case(scope.path()))
+            {
+                return Err(ChangeRequestError::Authentication);
+            }
             let items = self
                 .repositories
                 .lock()
@@ -689,12 +900,19 @@ pub(crate) mod tests {
                 .get(&scope.path().to_ascii_lowercase())
                 .cloned()
                 .ok_or(ChangeRequestError::CommandFailed)?;
+            let start = after
+                .and_then(|cursor| cursor.strip_prefix("at-")?.parse().ok())
+                .unwrap_or(0usize)
+                .min(items.len());
+            let end = self
+                .page_size
+                .map_or(items.len(), |size| (start + size).min(items.len()));
             Ok(ChangeRequestPage {
                 total_count: Some(items.len() as u64),
-                items,
-                next_cursor: None,
+                next_cursor: (end < items.len()).then(|| format!("at-{end}")),
+                items: items[start..end].to_vec(),
                 fetched_at: Some(chrono::Utc::now()),
-                presentation: None,
+                ..Default::default()
             })
         }
 
@@ -1054,5 +1272,222 @@ pub(crate) mod tests {
                 .await,
             Err(ChangeRequestError::CliUnavailable)
         );
+    }
+
+    /// `number` in `path`, last updated `minutes` after the epoch.
+    fn updated(path: &str, number: u64, minutes: i64) -> ChangeRequestListItem {
+        ChangeRequestListItem {
+            updated_at: DateTime::UNIX_EPOCH + chrono::TimeDelta::minutes(minutes),
+            ..item(path, number)
+        }
+    }
+
+    fn numbers(page: &ChangeRequestPage) -> Vec<u64> {
+        page.items.iter().map(|item| item.number).collect()
+    }
+
+    /// A folder's two repositories, two rows a page: `team/api` has five
+    /// change requests, `team/web` two.
+    fn folder() -> (
+        ChangeRequestBoardProviders,
+        Arc<Forge>,
+        Vec<ChangeRequestScope>,
+    ) {
+        let (providers, forge) = registry(
+            Forge::new()
+                .paged(2)
+                .with_items(
+                    "team/api",
+                    [(1, 50), (2, 40), (3, 30), (4, 20), (5, 10)]
+                        .map(|(number, minutes)| updated("team/api", number, minutes))
+                        .to_vec(),
+                )
+                .with_items(
+                    "team/web",
+                    [(11, 45), (12, 5)]
+                        .map(|(number, minutes)| updated("team/web", number, minutes))
+                        .to_vec(),
+                ),
+        );
+        let scopes = ["forge.test/team/api", "forge.test/team/web"]
+            .map(|wire| providers.parse(wire).unwrap())
+            .to_vec();
+        (providers, forge, scopes)
+    }
+
+    #[tokio::test]
+    async fn combined_pages_merge_newest_first_and_continue_each_repository() {
+        use ChangeRequestFilter::All;
+        let (providers, forge, scopes) = folder();
+        let first = providers
+            .list_combined_page(&scopes, All, None, false, false)
+            .await
+            .unwrap();
+        // Both first pages, newest update first across repositories.
+        assert_eq!(numbers(&first), [1, 11, 2, 12]);
+        assert_eq!(first.total_count, Some(7));
+        assert!(first.errors.is_empty());
+        assert_eq!(first.presentation.unwrap().provider_name, "Forge");
+        assert!(first.items.iter().all(|item| item.reference.is_some()));
+        assert_eq!(forge.take_listed(), ["team/api@", "team/web@"]);
+
+        // The web repository is done: "load more" continues the api alone.
+        let cursor = first.next_cursor.unwrap();
+        let second = providers
+            .list_combined_page(&scopes, All, Some(&cursor), false, false)
+            .await
+            .unwrap();
+        assert_eq!(numbers(&second), [3, 4]);
+        assert_eq!(second.total_count, None);
+        assert_eq!(forge.take_listed(), ["team/api@at-2"]);
+        let third = providers
+            .list_combined_page(&scopes, All, second.next_cursor.as_deref(), false, false)
+            .await
+            .unwrap();
+        assert_eq!(numbers(&third), [5]);
+        assert_eq!(third.next_cursor, None);
+        assert_eq!(forge.take_listed(), ["team/api@at-4"]);
+
+        // Cursors are checked before any adapter sees them.
+        for cursor in ["not base64!", "e30", ""] {
+            assert_eq!(
+                providers
+                    .list_combined_page(&scopes, All, Some(cursor), false, false)
+                    .await
+                    .err(),
+                Some(ChangeRequestError::Decode),
+                "{cursor}"
+            );
+        }
+        let bad =
+            encode_combined_cursor(&[("forge.test/team/api".into(), "x repo:other/x".into())])
+                .unwrap();
+        assert_eq!(
+            providers
+                .list_combined_page(&scopes, All, Some(&bad), false, false)
+                .await
+                .err(),
+            Some(ChangeRequestError::Decode)
+        );
+        assert!(forge.take_listed().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failing_repository_leaves_the_rest_of_a_combined_page() {
+        use ChangeRequestFilter::All;
+        let (providers, forge, scopes) = folder();
+        forge.set_failing(&["team/web"]);
+        let page = providers
+            .list_combined_page(&scopes, All, None, true, false)
+            .await
+            .unwrap();
+        assert_eq!(numbers(&page), [1, 2]);
+        assert_eq!(page.total_count, Some(5));
+        assert_eq!(
+            page.errors,
+            [ChangeRequestScopeError {
+                repository: "forge.test/team/web".into(),
+                code: zeron_rpc::capability_errors::PULL_REQUESTS_AUTHENTICATION.into(),
+            }]
+        );
+
+        // A continuation that fails is tried again by the next one.
+        forge.set_failing(&[]);
+        let first = providers
+            .list_combined_page(&scopes, All, None, true, false)
+            .await
+            .unwrap();
+        forge.set_failing(&["team/api"]);
+        let cursor = first.next_cursor.unwrap();
+        // Nothing loaded: the page fails, as a single repository's would.
+        assert_eq!(
+            providers
+                .list_combined_page(&scopes, All, Some(&cursor), true, false)
+                .await
+                .err(),
+            Some(ChangeRequestError::Authentication)
+        );
+        forge.set_failing(&[]);
+        let retried = providers
+            .list_combined_page(&scopes, All, Some(&cursor), true, false)
+            .await
+            .unwrap();
+        assert_eq!(numbers(&retried), [3, 4]);
+
+        // A repository no adapter names is refused, like a page of its own.
+        let unserved = vec![
+            scopes[0].clone(),
+            ChangeRequestScope::new("other.test", "team/app").unwrap(),
+        ];
+        let page = providers
+            .list_combined_page(&unserved, All, None, false, false)
+            .await
+            .unwrap();
+        assert_eq!(page.errors[0].repository, "other.test/team/app");
+        assert_eq!(
+            providers
+                .list_combined_page(&[], All, None, false, false)
+                .await
+                .err(),
+            Some(ChangeRequestError::UnsupportedRepository)
+        );
+    }
+
+    #[tokio::test]
+    async fn combined_pages_store_and_cache_each_repository_on_its_own() {
+        use ChangeRequestFilter::All;
+        let dir = tempfile::tempdir().unwrap();
+        let forge = Arc::new(
+            Forge::new()
+                .with_repository("team/api", &[1, 2])
+                .with_repository("team/web", &[11]),
+        );
+        let providers = ChangeRequestBoardProviders::for_tests(
+            vec![Arc::new(GitHubCli::offline()), forge.clone()],
+            Some(dir.path()),
+        );
+        let scopes = ["forge.test/team/api", "forge.test/team/web"]
+            .map(|wire| providers.parse(wire).unwrap())
+            .to_vec();
+        let first = providers
+            .list_combined_page(&scopes, All, None, false, true)
+            .await
+            .unwrap();
+        assert_eq!(first.items.len(), 3);
+        assert_eq!(forge.calls(), 2);
+        // Each repository's first page is stored under its own scope.
+        let store = ChangeRequestStore::new(dir.path());
+        for repository in ["forge.test/team/api", "forge.test/team/web"] {
+            let stored = store
+                .load("forge:forge.test:devuser", repository, All)
+                .await;
+            assert!(stored.is_some(), "{repository}");
+        }
+        // The combined page and a repository's own page share its answer.
+        providers
+            .list_combined_page(&scopes, All, None, false, false)
+            .await
+            .unwrap();
+        providers
+            .list_page(&scopes[1], All, None, false, false)
+            .await
+            .unwrap();
+        assert_eq!(forge.calls(), 2);
+        // A relaunch serves both stored pages without the adapter.
+        let relaunched_forge = Arc::new(Forge::new());
+        let relaunched = ChangeRequestBoardProviders::for_tests(
+            vec![relaunched_forge.clone()],
+            Some(dir.path()),
+        );
+        let stored = relaunched
+            .list_combined_page(&scopes, All, None, false, true)
+            .await
+            .unwrap();
+        assert_eq!(stored.items.len(), 3);
+        assert_eq!(
+            stored.fetched_at.map(|at| at.timestamp_millis()),
+            first.fetched_at.map(|at| at.timestamp_millis())
+        );
+        assert_eq!(relaunched_forge.calls(), 0);
     }
 }

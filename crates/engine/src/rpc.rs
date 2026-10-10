@@ -66,9 +66,7 @@ use zeron_proto::{
     ChatConfig, CreateWorktreeOutcome, EngineInfo, HarnessId, HarnessUpdatePolicy,
     ProjectActionDraft, Space, ToolCall, WorkspaceScope,
 };
-use zeron_rpc::{
-    LinkCache, RpcError, RpcReply, RpcService, capability_errors, methods, parse_params,
-};
+use zeron_rpc::{LinkCache, RpcError, RpcReply, RpcService, methods, parse_params};
 
 use crate::agent_accounts::AgentAccounts;
 use crate::auth::Auth;
@@ -1297,17 +1295,7 @@ fn should_invalidate_link(error: &RpcError) -> bool {
 }
 
 fn change_request_rpc_error(error: ChangeRequestError) -> RpcError {
-    let code = match error {
-        ChangeRequestError::CliUnavailable => capability_errors::PULL_REQUESTS_CLI_UNAVAILABLE,
-        ChangeRequestError::Authentication => capability_errors::PULL_REQUESTS_AUTHENTICATION,
-        ChangeRequestError::RateLimited => capability_errors::PULL_REQUESTS_RATE_LIMITED,
-        ChangeRequestError::Timeout => capability_errors::PULL_REQUESTS_TIMEOUT,
-        ChangeRequestError::Decode => capability_errors::PULL_REQUESTS_DECODE,
-        ChangeRequestError::RepositoryUnavailable
-        | ChangeRequestError::UnsupportedRepository
-        | ChangeRequestError::CommandFailed => capability_errors::PULL_REQUESTS_COMMAND_FAILED,
-    };
-    RpcError::Capability(code.into())
+    RpcError::Capability(error.code().into())
 }
 
 /// Reply deadline for a relay-forwarded unary call. The relay is WebSocket
@@ -1496,6 +1484,7 @@ fn forwardable(method: &str) -> bool {
             | methods::LIST_CHANGE_REQUEST_PAGE
             | methods::DESCRIBE_CHANGE_REQUEST_SCOPE
             | methods::GET_CHANGE_REQUEST_REPOSITORY
+            | methods::GET_CHANGE_REQUEST_REPOSITORIES
             | methods::GET_CHANGE_REQUEST
             | methods::GET_CHANGE_REQUEST_DIFF
             | methods::POST_CHANGE_REQUEST_COMMENT
@@ -2603,10 +2592,38 @@ impl RpcService for EngineRpc {
                 };
                 RpcReply::value(&scope.map(|scope| scope.to_string()))
             }
+            methods::GET_CHANGE_REQUEST_REPOSITORIES => {
+                #[derive(Deserialize)]
+                struct P {
+                    cwd: String,
+                }
+                let p: P = parse_params(params)?;
+                // The folder passes the same guard; only checkouts inside it
+                // are read, never its parents.
+                let cwd = self.change_request_root(&p.cwd).await?;
+                let repositories: Vec<_> = self
+                    .change_request_resolver
+                    .scopes_in_folder(&cwd)
+                    .await
+                    .into_iter()
+                    .map(|(path, scope)| zeron_proto::ChangeRequestRepository {
+                        repository: scope.to_string(),
+                        path,
+                        presentation: self.board().presentation(&scope),
+                    })
+                    .collect();
+                RpcReply::value(&repositories)
+            }
             methods::LIST_CHANGE_REQUEST_PAGE => {
                 #[derive(Deserialize)]
                 struct P {
-                    repository: String,
+                    #[serde(default)]
+                    repository: Option<String>,
+                    /// Several repositories as one page, instead of
+                    /// `repository`. Engines advertising
+                    /// `change-requests-multi-scope-v1` read it.
+                    #[serde(default)]
+                    repositories: Vec<String>,
                     #[serde(default)]
                     filter: zeron_proto::ChangeRequestFilter,
                     #[serde(default)]
@@ -2618,7 +2635,39 @@ impl RpcService for EngineRpc {
                     cached: bool,
                 }
                 let p: P = parse_params(params)?;
-                let Some(scope) = self.board().parse(&p.repository) else {
+                if !p.repositories.is_empty() {
+                    if p.repositories.len() > crate::change_request_board::COMBINED_SCOPE_LIMIT {
+                        return Err(RpcError::BadParams("too many repositories".into()));
+                    }
+                    let Some(scopes) = p
+                        .repositories
+                        .iter()
+                        .map(|repository| self.board().parse(repository))
+                        .collect::<Option<Vec<_>>>()
+                    else {
+                        return Err(RpcError::BadParams(
+                            "repositories must be owner/repo or host/path".into(),
+                        ));
+                    };
+                    // The combined cursor is checked as it is read.
+                    let page = self
+                        .board()
+                        .list_combined_page(
+                            &scopes,
+                            p.filter,
+                            p.after.as_deref(),
+                            p.refresh,
+                            p.cached,
+                        )
+                        .await
+                        .map_err(change_request_rpc_error)?;
+                    return RpcReply::value(&page);
+                }
+                let Some(scope) = p
+                    .repository
+                    .as_deref()
+                    .and_then(|repository| self.board().parse(repository))
+                else {
                     return Err(RpcError::BadParams(
                         "repository must be owner/repo or host/path".into(),
                     ));
@@ -3660,6 +3709,7 @@ impl RpcService for EngineRpc {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zeron_rpc::capability_errors;
 
     #[tokio::test]
     async fn voice_owner_is_shared_across_services_and_shutdown_retires_it() {
@@ -4198,6 +4248,8 @@ mod tests {
         assert!(forwardable(methods::DESCRIBE_CHANGE_REQUEST_SCOPE));
         assert!(!is_stream_method(methods::DESCRIBE_CHANGE_REQUEST_SCOPE));
         assert!(forwardable(methods::GET_CHANGE_REQUEST_REPOSITORY));
+        assert!(forwardable(methods::GET_CHANGE_REQUEST_REPOSITORIES));
+        assert!(!is_stream_method(methods::GET_CHANGE_REQUEST_REPOSITORIES));
         assert!(forwardable(methods::GET_CHANGE_REQUEST));
         assert!(forwardable(methods::GET_CHANGE_REQUEST_DIFF));
         assert!(forwardable(methods::POST_CHANGE_REQUEST_COMMENT));

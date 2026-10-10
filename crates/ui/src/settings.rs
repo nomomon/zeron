@@ -286,6 +286,17 @@ pub enum SavePolicy {
     Immediate,
 }
 
+/// A project folder the pull request board last showed as one list of its
+/// repositories. Its repositories are found again when it is restored.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct PullRequestFolder {
+    pub path: String,
+    /// The board's device; `None` is this one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum PullRequestDestination {
@@ -962,6 +973,10 @@ pub struct UiSettings {
     /// Last explicitly selected PR scope, restored when no project is selected.
     pub last_pull_request_repository: Option<String>,
     pub last_pull_request_device: Option<String>,
+    /// Last explicitly selected project folder, shown as one list; it wins
+    /// over the repository above while set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_pull_request_folder: Option<PullRequestFolder>,
     /// Device-local bookmarks, keyed by provider/repository/PR, never GitHub mutations.
     pub pull_request_stars: Vec<String>,
     /// Save edited workspace files automatically after the configured delay.
@@ -1074,6 +1089,7 @@ impl Default for UiSettings {
             pull_request_destination: PullRequestDestination::Native,
             last_pull_request_repository: None,
             last_pull_request_device: None,
+            last_pull_request_folder: None,
             pull_request_stars: Vec::new(),
             files_autosave_enabled: false,
             files_autosave_delay_ms: FILES_AUTOSAVE_DELAY_DEFAULT_MS,
@@ -1738,6 +1754,7 @@ impl UiSettings {
             pull_request_destination,
             last_pull_request_repository,
             last_pull_request_device,
+            last_pull_request_folder,
             pull_request_stars,
         );
         current
@@ -2786,6 +2803,10 @@ mod tests {
             pull_request_destination: PullRequestDestination::External,
             last_pull_request_repository: Some("acme/zeron".into()),
             last_pull_request_device: Some("remote-device".into()),
+            last_pull_request_folder: Some(PullRequestFolder {
+                path: "/home/devuser/workspace".into(),
+                device: Some("remote-device".into()),
+            }),
             pull_request_stars: vec!["https://github.com/acme/zeron/pull/123".into()],
             files_autosave_enabled: true,
             files_autosave_delay_ms: 1_500,
@@ -2820,6 +2841,7 @@ mod tests {
         let json = std::fs::read_to_string(UiSettings::path(dir.path())).unwrap();
         assert!(json.contains(r#""diffWrap": true"#));
         assert_eq!(UiSettings::load(dir.path()), settings);
+        assert!(json.contains(r#""path": "/home/devuser/workspace""#));
         assert!(json.contains(r#""codeFencesFitContent": true"#));
         assert!(json.contains(r#""openWebLinksInZeron": false"#));
         assert!(json.contains(r#""newThreadBackgroundEffect": "ascii""#));

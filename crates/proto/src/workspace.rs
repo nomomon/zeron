@@ -18,6 +18,10 @@ pub mod capabilities {
     /// The pull request board accepts host-qualified scopes (`host/path`)
     /// beside the bare `owner/repo` every engine reads.
     pub const CHANGE_REQUESTS_HOST_SCOPES_V1: &str = "change-requests-host-scopes-v1";
+    /// The pull request board lists a project folder's repositories
+    /// (`GetChangeRequestRepositories`) and reads several as one page
+    /// (`ListChangeRequestPage` with `repositories`).
+    pub const CHANGE_REQUESTS_MULTI_SCOPE_V1: &str = "change-requests-multi-scope-v1";
 
     pub const CURRENT: &[&str] = &[
         COMPOSER_REFERENCES_V1,
@@ -29,6 +33,7 @@ pub mod capabilities {
         HARNESS_UPDATES_V1,
         crate::voice::remote::CAPABILITY,
         CHANGE_REQUESTS_HOST_SCOPES_V1,
+        CHANGE_REQUESTS_MULTI_SCOPE_V1,
     ];
 
     pub fn current() -> Vec<String> {
@@ -110,7 +115,8 @@ mod tests {
                     "message-queue-edit-lease-v1",
                     "harness-updates-v1",
                     "voice-client-media-v1",
-                    "change-requests-host-scopes-v1"
+                    "change-requests-host-scopes-v1",
+                    "change-requests-multi-scope-v1"
                 ],
             })
         );

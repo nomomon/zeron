@@ -112,6 +112,7 @@ impl ChangeRequestStore {
                 total_count: total_count.and_then(|count| u64::try_from(count).ok()),
                 fetched_at: Utc.timestamp_millis_opt(fetched_at).single(),
                 presentation: None,
+                errors: Vec::new(),
             })
         })
     }
@@ -353,6 +354,7 @@ mod tests {
             next_cursor: Some("Y3Vyc29yOjUw".into()),
             fetched_at: Some(fetched_at),
             presentation: None,
+            errors: Vec::new(),
         }
     }
 
