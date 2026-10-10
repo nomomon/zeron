@@ -11,7 +11,8 @@ use gpui::{
 };
 use zeron_proto::{
     ChangeRequestFeatures, ChangeRequestFilter, ChangeRequestListItem, ChangeRequestMergeability,
-    ChangeRequestPage, ChangeRequestPresentation, ChangeRequestReviewDecision, Device,
+    ChangeRequestPage, ChangeRequestPresentation, ChangeRequestRepository,
+    ChangeRequestReviewDecision, ChangeRequestScopeError, Device,
 };
 use zeron_rpc::{RpcError, capability_errors, methods};
 
@@ -39,6 +40,8 @@ const HEADER_CONTROL_HEIGHT: f32 = 32.0;
 struct Paging {
     next_cursor: Option<String>,
     total: Option<u64>,
+    /// A folder's repositories whose rows didn't load.
+    errors: Vec<ChangeRequestScopeError>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,6 +54,8 @@ enum PullRequestsPageError {
     UpdateRequired(String),
     /// The device's engine reads only bare `owner/repo` scopes.
     HostScopesUnsupported(String),
+    /// The device's engine reads one repository at a time.
+    FoldersUnsupported(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -288,6 +293,116 @@ pub(crate) fn star_button(url: &str, theme: &Theme, cx: &gpui::App) -> gpui::Sta
         })
 }
 
+/// A project folder the board shows as one list: the repositories its
+/// device found inside it, read together.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FolderBoard {
+    project: ProjectRef,
+    name: String,
+    /// As the device listed them, each with its checkout's folder.
+    repositories: Vec<ChangeRequestRepository>,
+}
+
+impl FolderBoard {
+    /// The board's key for the folder, where a repository's scope would
+    /// be. It never parses as one.
+    fn key(&self) -> String {
+        format!("folder:{}", self.project.path)
+    }
+
+    fn scopes(&self) -> Vec<String> {
+        self.repositories
+            .iter()
+            .map(|repository| repository.repository.clone())
+            .collect()
+    }
+
+    fn find(&self, repository: &str) -> Option<&ChangeRequestRepository> {
+        self.repositories
+            .iter()
+            .find(|found| found.repository.eq_ignore_ascii_case(repository))
+    }
+
+    /// How a row names its repository: the checkout's folder, else the
+    /// last segment of the repository's path.
+    fn label<'a>(&'a self, repository: &'a str) -> &'a str {
+        self.find(repository)
+            .map(|found| found.path.as_str())
+            .filter(|path| !path.is_empty())
+            .unwrap_or_else(|| repository.rsplit('/').next().unwrap_or(repository))
+    }
+
+    /// The presentation of `repository`'s provider: its own, else that of
+    /// a repository on its host (a row may carry a renamed repository).
+    fn presentation(&self, repository: &str) -> Option<&ChangeRequestPresentation> {
+        let host = |wire: &str| {
+            zeron_proto::ChangeRequestScope::parse(wire).map(|scope| scope.host().to_owned())
+        };
+        self.find(repository)
+            .and_then(|found| found.presentation.as_ref())
+            .or_else(|| {
+                let wanted = host(repository)?;
+                self.repositories
+                    .iter()
+                    .filter(|found| host(&found.repository).as_ref() == Some(&wanted))
+                    .find_map(|found| found.presentation.as_ref())
+            })
+    }
+}
+
+/// What a project's device says the board should show for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Detection {
+    Repository(String),
+    Folder(Vec<ChangeRequestRepository>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DetectionError {
+    Unreadable,
+    Unavailable,
+}
+
+/// Ask `target` (`None` for this device) what the project at `cwd` shows:
+/// its checkout's repository, or with `folder` the repositories directly
+/// inside it, one of which opens on its own.
+async fn detect_project(
+    engine: &crate::state::EngineHandle,
+    cwd: &str,
+    target: Option<&str>,
+    folder: bool,
+) -> Result<Option<Detection>, DetectionError> {
+    let mut params = params_for_target(target);
+    params["cwd"] = cwd.into();
+    let method = if folder {
+        methods::GET_CHANGE_REQUEST_REPOSITORIES
+    } else {
+        methods::GET_CHANGE_REQUEST_REPOSITORY
+    };
+    let value = engine
+        .client()
+        .call(method, params)
+        .await
+        .map_err(|_| DetectionError::Unavailable)?;
+    if !folder {
+        return serde_json::from_value::<Option<String>>(value)
+            .map_err(|_| DetectionError::Unreadable)
+            .map(|repository| {
+                repository
+                    .filter(|repository| valid_repository_filter(repository))
+                    .map(Detection::Repository)
+            });
+    }
+    let mut repositories = serde_json::from_value::<Vec<ChangeRequestRepository>>(value)
+        .map_err(|_| DetectionError::Unreadable)?;
+    repositories.retain(|found| valid_repository_filter(&found.repository));
+    Ok(match repositories.len() {
+        0 => None,
+        1 => Some(Detection::Repository(repositories.remove(0).repository)),
+        _ => Some(Detection::Folder(repositories)),
+    })
+}
+
 /// Repository-scoped dashboard with lazy, cached relationship filters.
 pub struct PullRequestsPage {
     state: Entity<AppState>,
@@ -297,6 +412,8 @@ pub struct PullRequestsPage {
     repository: Option<String>,
     initial_scope_attempted: bool,
     initial_scope_task: Option<Task<()>>,
+    /// The project folder shown as one list, when `repository` is its key.
+    folder: Option<FolderBoard>,
     resolving_project: Option<ProjectRef>,
     project_repositories: HashMap<ProjectRef, String>,
     project_icons: crate::shell::project_icon::ProjectIcons,
@@ -568,6 +685,7 @@ impl PullRequestsPage {
             repository: None,
             initial_scope_attempted: false,
             initial_scope_task: None,
+            folder: None,
             resolving_project: None,
             project_repositories: HashMap::new(),
             project_icons: Default::default(),
@@ -644,6 +762,14 @@ impl PullRequestsPage {
             .last_pull_request_repository
             .filter(|repo| valid_repository_filter(repo))
             .map(|repo| (repo, saved.last_pull_request_device));
+        // A folder chosen last is found again on its device.
+        let saved_folder = saved
+            .last_pull_request_folder
+            .filter(|folder| !folder.path.is_empty())
+            .map(|folder| ProjectRef {
+                path: folder.path,
+                device: folder.device.unwrap_or_else(|| local.clone()),
+            });
         let candidates =
             match &context {
                 Some(project) => {
@@ -666,9 +792,23 @@ impl PullRequestsPage {
                     candidates.truncate(4);
                     candidates
                 }
-                None if fallback.is_some() => Vec::new(),
-                None => recent_git_projects(state, &local),
+                None => match saved_folder {
+                    Some(folder) => vec![folder],
+                    None if fallback.is_some() => Vec::new(),
+                    None => recent_git_projects(state, &local),
+                },
             };
+        // Each candidate's device, whether it is a folder of checkouts its
+        // device can list, and the name it goes by.
+        let candidates: Vec<_> = candidates
+            .into_iter()
+            .map(|project| {
+                let target = (project.device != local).then(|| project.device.clone());
+                let folder = reads_folder(state, &project);
+                let name = project_name(state, &project);
+                (project, target, folder, name)
+            })
+            .collect();
         self.seen_context = context;
         if candidates.is_empty() {
             if let Some((repo, target)) = fallback {
@@ -682,25 +822,19 @@ impl PullRequestsPage {
         self.initial_scope_task = Some(cx.spawn(async move |this, cx| {
             let mut discovery_failed = false;
             let mut found = None;
-            for project in candidates {
-                let target = (project.device != local).then(|| project.device.clone());
-                let mut params = params_for_target(target.as_deref());
-                params["cwd"] = project.path.clone().into();
-                let request = engine.client().call(methods::GET_CHANGE_REQUEST_REPOSITORY, params);
-                let deadline = cx.background_executor().timer(std::time::Duration::from_secs(3));
-                futures::pin_mut!(request, deadline);
-                let result = match futures::future::select(request, deadline).await {
-                    futures::future::Either::Left((result, _)) => result,
-                    futures::future::Either::Right(_) => Err(RpcError::Failed("Repository detection timed out".into())),
+            for (project, target, folder, name) in candidates {
+                let result = {
+                    let request = detect_project(&engine, &project.path, target.as_deref(), folder);
+                    let deadline = cx.background_executor().timer(std::time::Duration::from_secs(3));
+                    futures::pin_mut!(request, deadline);
+                    match futures::future::select(request, deadline).await {
+                        futures::future::Either::Left((result, _)) => result,
+                        futures::future::Either::Right(_) => Err(DetectionError::Unavailable),
+                    }
                 };
-                discovery_failed |= result.is_err();
-                if let Some(repository) = result
-                    .ok()
-                    .and_then(|value| serde_json::from_value::<Option<String>>(value).ok())
-                    .flatten()
-                    .filter(|repo| valid_repository_filter(repo))
-                {
-                    found = Some((repository, target, project));
+                discovery_failed |= result == Err(DetectionError::Unavailable);
+                if let Ok(Some(detection)) = result {
+                    found = Some((detection, target, project, name));
                     break;
                 }
             }
@@ -711,14 +845,21 @@ impl PullRequestsPage {
                     return;
                 }
                 page.load_state = PullRequestsLoadState::Idle;
-                let found = found.map(|(repo, target, project)| {
-                    page.project_repositories.insert(project, repo.clone());
-                    (repo, target)
-                });
-                if let Some((repo, target)) = found.or(fallback) {
-                    page.apply_initial_repository(repo, target, cx);
-                } else if discovery_failed && explicit_context {
-                    crate::toast::error(cx, "Couldn’t detect this project’s repository. Choose a repository to continue.");
+                match found {
+                    Some((Detection::Folder(repositories), target, project, name)) => {
+                        page.apply_folder(FolderBoard { project, name, repositories }, target, cx);
+                    }
+                    Some((Detection::Repository(repo), target, project, _)) => {
+                        page.project_repositories.insert(project, repo.clone());
+                        page.apply_initial_repository(repo, target, cx);
+                    }
+                    None => {
+                        if let Some((repo, target)) = fallback {
+                            page.apply_initial_repository(repo, target, cx);
+                        } else if discovery_failed && explicit_context {
+                            crate::toast::error(cx, "Couldn’t detect this project’s repository. Choose a repository to continue.");
+                        }
+                    }
                 }
                 cx.notify();
             });
@@ -742,6 +883,7 @@ impl PullRequestsPage {
         }
         self.cancel_project_detection();
         self.repository = None;
+        self.folder = None;
         self.automatic_filter = true;
         self.initial_scope_task = None;
         self.initial_scope_attempted = false;
@@ -758,6 +900,55 @@ impl PullRequestsPage {
         self.repository_input
             .update(cx, |input, cx| input.set_text(&repository, cx));
         self.select_repository(cx);
+    }
+
+    /// Show `folder`'s repositories as one board on `target`, as a chosen
+    /// repository would be shown, and remember the folder.
+    fn apply_folder(
+        &mut self,
+        folder: FolderBoard,
+        target: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.cancel_project_detection();
+        self.close_repository_menu(cx);
+        self.initial_scope_task = None;
+        self.initial_scope_attempted = true;
+        let saved = crate::settings::PullRequestFolder {
+            path: folder.project.path.clone(),
+            device: target.clone(),
+        };
+        crate::settings::update(crate::settings::SavePolicy::Debounced, cx, |settings| {
+            settings.last_pull_request_folder = Some(saved);
+        });
+        self.repository_input
+            .update(cx, |input, cx| input.set_text("", cx));
+        let key = folder.key();
+        // A failure before any page names its provider by the first
+        // repository's, as the first page will.
+        if let Some(presentation) = folder
+            .repositories
+            .first()
+            .and_then(|found| found.presentation.clone())
+        {
+            self.presentations
+                .insert((target.clone(), key.to_ascii_lowercase()), presentation);
+        }
+        let unchanged = self.repository.as_deref() == Some(key.as_str())
+            && self.target_device == target
+            && self
+                .folder
+                .as_ref()
+                .is_some_and(|current| current.scopes() == folder.scopes());
+        self.folder = Some(folder);
+        if !unchanged {
+            self.repository = Some(key);
+            self.reset_for_target(target, cx);
+        }
+        if self.last_loaded_at.is_none() {
+            self.load(false, cx);
+        }
+        cx.notify();
     }
 
     pub(crate) fn on_project_scope_changed(&mut self, cx: &mut Context<Self>) {
@@ -889,11 +1080,13 @@ impl PullRequestsPage {
         self.close_repository_menu(cx);
         self.initial_scope_task = None;
         self.initial_scope_attempted = true;
+        self.folder = None;
         let saved_repository = repository.clone();
         let saved_device = self.target_device.clone();
         crate::settings::update(crate::settings::SavePolicy::Debounced, cx, |settings| {
             settings.last_pull_request_repository = Some(saved_repository);
             settings.last_pull_request_device = saved_device;
+            settings.last_pull_request_folder = None;
         });
         // GitHub's casing, adopted after a load, names the same repository.
         if !self
@@ -1030,28 +1223,30 @@ impl PullRequestsPage {
             .unwrap_or(&engine.engine_info().device_id);
         let target = (device != local).then(|| device.clone());
         let project = ProjectRef { path, device };
-        let mut params = params_for_target(target.as_deref());
-        params["cwd"] = project.path.clone().into();
+        let folder = reads_folder(state, &project);
+        let name = project_name(state, &project);
         self.initial_scope_attempted = true;
         self.project_repositories.remove(&project);
         self.resolving_project = Some(project.clone());
         self.initial_scope_task = Some(cx.spawn(async move |this, cx| {
-            let request = engine
-                .client()
-                .call(methods::GET_CHANGE_REQUEST_REPOSITORY, params);
-            let deadline = cx
-                .background_executor()
-                .timer(std::time::Duration::from_secs(3));
-            futures::pin_mut!(request, deadline);
-            let repository = match futures::future::select(request, deadline).await {
-                futures::future::Either::Left((Ok(value), _)) => {
-                    serde_json::from_value::<Option<String>>(value)
-                        .map_err(|_| "The device returned an unreadable repository. Try again.")
-                        .and_then(|repo| repo.filter(|repo| valid_repository_filter(repo))
-                            .ok_or("This project has no GitHub remote. Enter owner/repository to open it directly."))
+            let detected = {
+                let request = detect_project(&engine, &project.path, target.as_deref(), folder);
+                let deadline = cx
+                    .background_executor()
+                    .timer(std::time::Duration::from_secs(3));
+                futures::pin_mut!(request, deadline);
+                match futures::future::select(request, deadline).await {
+                    futures::future::Either::Left((result, _)) => Some(result),
+                    futures::future::Either::Right(_) => None,
                 }
-                futures::future::Either::Left((Err(_), _)) => Err("Couldn’t read this project’s repository. Check the device connection and try again."),
-                futures::future::Either::Right(_) => Err("Repository detection timed out. Try again or enter owner/repository."),
+            };
+            let detection = match detected {
+                Some(Ok(Some(detection))) => Ok(detection),
+                Some(Ok(None)) if folder => Err("This folder holds no repository the board can open. Enter one to open it directly."),
+                Some(Ok(None)) => Err("This project has no GitHub remote. Enter owner/repository to open it directly."),
+                Some(Err(DetectionError::Unreadable)) => Err("The device returned an unreadable repository. Try again."),
+                Some(Err(DetectionError::Unavailable)) => Err("Couldn’t read this project’s repository. Check the device connection and try again."),
+                None => Err("Repository detection timed out. Try again or enter owner/repository."),
             };
             let _ = this.update(cx, |page, cx| {
                 if page.resolving_project.as_ref() != Some(&project) {
@@ -1059,14 +1254,18 @@ impl PullRequestsPage {
                 }
                 page.initial_scope_task = None;
                 page.resolving_project = None;
-                match repository {
-                    Ok(repository) => {
+                match detection {
+                    Ok(Detection::Repository(repository)) => {
                         page.project_repositories.insert(project, repository.clone());
                         if page.target_device != target {
                             page.reset_for_target(target.clone(), cx);
                         }
                         page.return_focus = Some(page.repository_focus.clone());
                         page.apply_initial_repository(repository, target, cx);
+                    }
+                    Ok(Detection::Folder(repositories)) => {
+                        page.return_focus = Some(page.repository_focus.clone());
+                        page.apply_folder(FolderBoard { project, name, repositories }, target, cx);
                     }
                     Err(error) => crate::toast::error(cx, error),
                 }
@@ -1078,11 +1277,15 @@ impl PullRequestsPage {
 
     fn project_is_selected(&self, project: &ProjectRef, local: Option<&str>) -> bool {
         self.target_device.as_deref().or(local) == Some(project.device.as_str())
-            && self.project_repositories.get(project).is_some_and(|repo| {
-                self.repository
-                    .as_ref()
-                    .is_some_and(|current| current.eq_ignore_ascii_case(repo))
-            })
+            && (self
+                .folder
+                .as_ref()
+                .is_some_and(|folder| folder.project == *project)
+                || self.project_repositories.get(project).is_some_and(|repo| {
+                    self.repository
+                        .as_ref()
+                        .is_some_and(|current| current.eq_ignore_ascii_case(repo))
+                }))
     }
 
     fn recent_repositories(&self) -> Vec<String> {
@@ -1096,6 +1299,8 @@ impl PullRequestsPage {
                     .filter(|((target, _, _), ..)| target == &self.target_device)
                     .map(|((_, repo, _), ..)| repo),
             )
+            // A folder reopens from its project row, not as a repository.
+            .filter(|repo| valid_repository_filter(repo))
             .filter(|repo| seen.insert(repo.to_ascii_lowercase()))
             .take(5)
             .cloned()
@@ -1108,13 +1313,18 @@ impl PullRequestsPage {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let label = self.repository.clone().unwrap_or_else(|| {
-            if self.initial_scope_task.is_some() {
-                "Detecting repository…".into()
-            } else {
-                "Choose repository".into()
-            }
-        });
+        let label = self
+            .folder
+            .as_ref()
+            .map(|folder| folder.name.clone())
+            .or_else(|| self.repository.clone())
+            .unwrap_or_else(|| {
+                if self.initial_scope_task.is_some() {
+                    "Detecting repository…".into()
+                } else {
+                    "Choose repository".into()
+                }
+            });
         let (projects, local, profile, selected_space, device, online) = {
             let state = self.state.read(cx);
             let local = state.local_device_id.clone().or_else(|| {
@@ -1128,7 +1338,11 @@ impl PullRequestsPage {
                 .or_else(|| local.clone())
                 .unwrap_or_default();
             let projects = if self.repository_menu.get().is_some() {
-                picker_projects(state, &device)
+                let folders = state.device_supports(
+                    &device,
+                    zeron_proto::capabilities::CHANGE_REQUESTS_MULTI_SCOPE_V1,
+                );
+                picker_projects(state, &device, folders)
             } else {
                 Vec::new()
             };
@@ -1147,7 +1361,7 @@ impl PullRequestsPage {
                 .spaces
                 .iter()
                 .find(|space| {
-                    space.git_detected
+                    (space.git_detected || self.folder.is_some())
                         && self.project_is_selected(
                             &ProjectRef {
                                 path: space.path.clone(),
@@ -1628,11 +1842,22 @@ impl PullRequestsPage {
             cx.notify();
             return;
         }
+        if self.folder.is_some()
+            && !self.target_supports(
+                zeron_proto::capabilities::CHANGE_REQUESTS_MULTI_SCOPE_V1,
+                cx,
+            )
+        {
+            self.load_state = PullRequestsLoadState::Failed(
+                PullRequestsPageError::FoldersUnsupported(target_name),
+            );
+            cx.notify();
+            return;
+        }
 
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
-        let mut params = params_for_target(self.target_device.as_deref());
-        params["repository"] = self.repository.clone().unwrap().into();
+        let mut params = self.scope_params();
         params["refresh"] = refresh.into();
         params["cached"] = cached.into();
         params["filter"] = serde_json::to_value(self.filter).unwrap();
@@ -1643,12 +1868,14 @@ impl PullRequestsPage {
         self.more_error = None;
         // A first load that fails has no page to name its provider; engines
         // that read host scopes describe it alone.
-        let describe = (self.presentation_data().is_none() && self.target_supports_host_scopes(cx))
-            .then(|| {
-                let mut params = params_for_target(self.target_device.as_deref());
-                params["repository"] = self.repository.clone().unwrap().into();
-                params
-            });
+        let describe = (self.presentation_data().is_none()
+            && self.folder.is_none()
+            && self.target_supports_host_scopes(cx))
+        .then(|| {
+            let mut params = params_for_target(self.target_device.as_deref());
+            params["repository"] = self.repository.clone().unwrap().into();
+            params
+        });
         self.request_task = Some(cx.spawn(async move |this, cx| {
             let mut result = fetch_page(&engine, params.clone()).await;
             if result.as_ref().is_ok_and(|page| page.items.is_empty()) && !refresh {
@@ -1706,6 +1933,7 @@ impl PullRequestsPage {
                 let paging = loaded.as_ref().ok().map(|page| Paging {
                     next_cursor: page.next_cursor.clone(),
                     total: page.total_count,
+                    errors: page.errors.clone(),
                 });
                 let succeeded = loaded.is_ok();
                 page.load_state = settle_snapshot(&mut page.items, loaded.map(|page| page.items));
@@ -1714,7 +1942,9 @@ impl PullRequestsPage {
                     page.paging = paging;
                 }
                 if succeeded {
-                    if let Some(first) = page.items.first()
+                    // A folder's rows name their own repositories.
+                    if page.folder.is_none()
+                        && let Some(first) = page.items.first()
                         && valid_repository_filter(&first.repository)
                         && page
                             .items
@@ -1768,7 +1998,13 @@ impl PullRequestsPage {
     }
 
     fn target_supports_host_scopes(&self, cx: &gpui::App) -> bool {
-        let capability = zeron_proto::capabilities::CHANGE_REQUESTS_HOST_SCOPES_V1;
+        self.target_supports(
+            zeron_proto::capabilities::CHANGE_REQUESTS_HOST_SCOPES_V1,
+            cx,
+        )
+    }
+
+    fn target_supports(&self, capability: &str, cx: &gpui::App) -> bool {
         let state = self.state.read(cx);
         match self.target_device.as_deref() {
             Some(target) => state.device_supports(target, capability),
@@ -1776,6 +2012,26 @@ impl PullRequestsPage {
                 .engine()
                 .is_some_and(|engine| engine.engine_info().supports(capability)),
         }
+    }
+
+    /// What a page request names: the repository, or a folder's
+    /// repositories, on the board's device.
+    fn scope_params(&self) -> serde_json::Value {
+        let mut params = params_for_target(self.target_device.as_deref());
+        match &self.folder {
+            Some(folder) => params["repositories"] = folder.scopes().into(),
+            None => params["repository"] = self.repository.clone().unwrap_or_default().into(),
+        }
+        params
+    }
+
+    /// The presentation of `item`'s provider: on a folder's board, its
+    /// repository's.
+    fn row_presentation(&self, item: &ChangeRequestListItem) -> Option<&ChangeRequestPresentation> {
+        self.folder
+            .as_ref()
+            .and_then(|folder| folder.presentation(&item.repository))
+            .or_else(|| self.presentation_data())
     }
 
     /// The current scope's presentation, once a page (or the engine) said.
@@ -1794,9 +2050,8 @@ impl PullRequestsPage {
     pub(crate) fn presentation_for(&self, url: &str) -> Option<ChangeRequestPresentation> {
         self.items
             .iter()
-            .any(|item| item.url == url)
-            .then(|| self.presentation_data().cloned())
-            .flatten()
+            .find(|item| item.url == url)
+            .and_then(|item| self.row_presentation(item).cloned())
     }
 
     fn remember_presentation(&mut self, presentation: ChangeRequestPresentation) {
@@ -1845,8 +2100,7 @@ impl PullRequestsPage {
         };
         let target_name = selected_device_name(&self.state.read(cx), self.target_device.as_deref());
         let generation = self.generation;
-        let mut params = params_for_target(self.target_device.as_deref());
-        params["repository"] = self.repository.clone().unwrap().into();
+        let mut params = self.scope_params();
         params["filter"] = serde_json::to_value(self.filter).unwrap();
         params["after"] = cursor.into();
         // Pages after a refreshed first page must be as fresh as it is.
@@ -1871,9 +2125,19 @@ impl PullRequestsPage {
                                 .into_iter()
                                 .filter(|item| !known.contains(&item.url)),
                         );
+                        let mut errors = std::mem::take(&mut page.paging.errors);
+                        for error in next.errors {
+                            if !errors
+                                .iter()
+                                .any(|known| known.repository == error.repository)
+                            {
+                                errors.push(error);
+                            }
+                        }
                         page.paging = Paging {
                             next_cursor: next.next_cursor,
                             total: next.total_count.or(page.paging.total),
+                            errors,
                         };
                         page.view_items = None;
                         page.store_snapshot(page.last_loaded_at.unwrap_or_else(Instant::now));
@@ -2108,6 +2372,45 @@ impl PullRequestsPage {
         }
 
         trigger.into_any_element()
+    }
+
+    /// One notice naming a folder's repositories that didn't load, and why,
+    /// above the rows that did.
+    fn render_scope_errors(&self, theme: &Theme) -> Option<gpui::Div> {
+        Some(
+            crate::notice::notice_chip(
+                theme,
+                true,
+                "Some repositories didn’t load",
+                self.scope_error_summary()?,
+                crate::notice::NoticeChipIcon::Plain,
+            )
+            .debug_selector(|| "pr-scope-errors".into()),
+        )
+    }
+
+    /// Each repository that didn't load, by its short name, and why, in its
+    /// own provider's words.
+    fn scope_error_summary(&self) -> Option<String> {
+        let folder = self.folder.as_ref()?;
+        if self.paging.errors.is_empty() || !matches!(self.load_state, PullRequestsLoadState::Ready)
+        {
+            return None;
+        }
+        let reasons: Vec<String> = self
+            .paging
+            .errors
+            .iter()
+            .map(|error| {
+                let failure = map_rpc_error(&RpcError::Capability(error.code.clone()), "");
+                let presentation = crate::pull_request_provider::presentation(
+                    folder.presentation(&error.repository),
+                );
+                let (title, _) = error_copy(&failure, &presentation);
+                format!("{}: {title}", folder.label(&error.repository))
+            })
+            .collect();
+        Some(reasons.join(" · "))
     }
 
     fn render_empty_or_error(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
@@ -2714,6 +3017,9 @@ impl Render for PullRequestsPage {
                         }),
                     ),
             )
+            .when_some(self.render_scope_errors(&theme), |el, notice| {
+                el.child(div().mt(px(12.0)).child(notice))
+            })
             .when(!self.query.is_empty(), |el| {
                 el.child(
                     div()
@@ -2896,7 +3202,10 @@ impl PullRequestsPage {
                     .when(last, |el| el.rounded_b(px(12.0)))
                     .child(render_table_row(
                         item,
-                        self.presentation_data()
+                        self.folder
+                            .as_ref()
+                            .map(|folder| folder.label(&item.repository)),
+                        self.row_presentation(item)
                             .map(|presentation| presentation.features),
                         layout,
                         self.sort.field,
@@ -3063,6 +3372,7 @@ pub(crate) fn table_row_shell(
 
 fn render_table_row(
     item: &ChangeRequestListItem,
+    repository: Option<&str>,
     features: Option<ChangeRequestFeatures>,
     layout: PullRequestTableLayout,
     sort_field: PullRequestSortField,
@@ -3125,7 +3435,7 @@ fn render_table_row(
             ))
     };
     if layout == PullRequestTableLayout::Narrow {
-        row.child(render_pr_identity(item, theme))
+        row.child(render_pr_identity(item, repository, theme))
             .child(
                 div()
                     .pl(px(22.0))
@@ -3139,7 +3449,7 @@ fn render_table_row(
             )
             .into_any_element()
     } else {
-        row.child(render_pr_identity(item, theme))
+        row.child(render_pr_identity(item, repository, theme))
             .child(
                 div()
                     .w(px(112.0))
@@ -3175,7 +3485,12 @@ fn status_description(item: &ChangeRequestListItem) -> String {
     labels.join(" · ")
 }
 
-fn render_pr_identity(item: &ChangeRequestListItem, theme: &Theme) -> AnyElement {
+/// `repository` names the row's repository on a board showing several.
+fn render_pr_identity(
+    item: &ChangeRequestListItem,
+    repository: Option<&str>,
+    theme: &Theme,
+) -> AnyElement {
     let title = SharedString::from(single_line(&item.title));
     let full_title = title.clone();
     let assessment = Facts::from_item(item).assess();
@@ -3244,6 +3559,23 @@ fn render_pr_identity(item: &ChangeRequestListItem, theme: &Theme) -> AnyElement
                 .items_center()
                 .gap(px(Theme::SPACE_SM))
                 .min_w_0()
+                .when_some(repository, |el, repository| {
+                    el.child(
+                        div()
+                            .id(SharedString::from(format!(
+                                "pr-repository-{}",
+                                pull_request_key(item)
+                            )))
+                            .debug_selector(|| "pr-row-repository".into())
+                            .min_w_0()
+                            .max_w(px(150.0))
+                            .truncate()
+                            .text_size(crate::typography::ui_rems(11.0))
+                            .text_color(theme.text_muted)
+                            .tooltip(widgets::text_tooltip(item.repository.clone()))
+                            .child(repository.to_owned()),
+                    )
+                })
                 .child(
                     div()
                         .flex()
@@ -3523,7 +3855,9 @@ fn recent_git_projects(state: &AppState, local: &str) -> Vec<ProjectRef> {
 
 /// The repository picker's projects on `device`, the board's device: each
 /// project (one per repository across devices, [`AppState::projects`]) by
-/// its checkouts there, with their paths when it has several. A project
+/// its checkouts there, with their paths when it has several. With
+/// `folders`, a project that is no checkout is offered too: its device
+/// lists the checkouts inside it, and the board shows them as one. A project
 /// with none there is left out, as the composer's device chip lists only
 /// devices holding the picked project: detection, and every page after it,
 /// runs on the board's device, so a checkout elsewhere could only fail or
@@ -3531,6 +3865,7 @@ fn recent_git_projects(state: &AppState, local: &str) -> Vec<ProjectRef> {
 fn picker_projects(
     state: &AppState,
     device: &str,
+    folders: bool,
 ) -> Vec<(String, Vec<(zeron_proto::Space, Option<String>)>)> {
     state
         .projects()
@@ -3542,7 +3877,7 @@ fn picker_projects(
                 .to_owned();
             let here: Vec<_> = members
                 .into_iter()
-                .filter(|space| space.device_id == device && space.git_detected)
+                .filter(|space| space.device_id == device && (space.git_detected || folders))
                 .collect();
             let several = here.len() > 1;
             let checkouts: Vec<_> = here
@@ -3552,6 +3887,35 @@ fn picker_projects(
             (!checkouts.is_empty()).then_some((name, checkouts))
         })
         .collect()
+}
+
+/// Whether the board shows `project` as a folder of checkouts: it is no
+/// checkout itself, and its device lists the repositories inside one.
+fn reads_folder(state: &AppState, project: &ProjectRef) -> bool {
+    !state.spaces.iter().any(|space| {
+        space.path == project.path && space.device_id == project.device && space.git_detected
+    }) && state.device_supports(
+        &project.device,
+        zeron_proto::capabilities::CHANGE_REQUESTS_MULTI_SCOPE_V1,
+    )
+}
+
+/// The name `project` goes by: its project's, else its folder's.
+fn project_name(state: &AppState, project: &ProjectRef) -> String {
+    state
+        .spaces
+        .iter()
+        .find(|space| space.path == project.path && space.device_id == project.device)
+        .map(|space| state.representative_space(space).display_name().to_owned())
+        .unwrap_or_else(|| {
+            project
+                .path
+                .trim_end_matches(['/', '\\'])
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap_or(&project.path)
+                .to_owned()
+        })
 }
 
 fn repository_menu_label(theme: &Theme, label: &str) -> gpui::Div {
@@ -3659,6 +4023,10 @@ fn error_copy(
         PullRequestsPageError::HostScopesUnsupported(name) => (
             format!("Update Zeron on {name}"),
             "This device opens only github.com repositories so far.".into(),
+        ),
+        PullRequestsPageError::FoldersUnsupported(name) => (
+            format!("Update Zeron on {name}"),
+            "This device opens one repository at a time so far.".into(),
         ),
     }
 }
@@ -3816,6 +4184,7 @@ mod tests {
             div().w_full().child(render_table_row(
                 &self.item,
                 None,
+                None,
                 table_layout(width),
                 PullRequestSortField::Updated,
                 true,
@@ -3961,7 +4330,7 @@ mod tests {
             space("notes", "local", false, 1),
         ];
         let rows = |device: &str| {
-            picker_projects(&state, device)
+            picker_projects(&state, device, false)
                 .into_iter()
                 .flat_map(|(_, members)| members)
                 .map(|(space, detail)| (space.id, detail))
@@ -3986,6 +4355,13 @@ mod tests {
             ]
         );
         assert!(rows("elsewhere").is_empty());
+        // A device that reads folders offers the project without Git too.
+        let folders: Vec<_> = picker_projects(&state, "local", true)
+            .into_iter()
+            .flat_map(|(_, members)| members)
+            .map(|(space, _)| space.id)
+            .collect();
+        assert_eq!(folders, ["local-only", "notes", "shared-local"]);
     }
 
     #[gpui::test]
@@ -4535,6 +4911,7 @@ mod tests {
                     shared("shared-local", "local"),
                     shared("shared-remote", "remote"),
                     space("local-only", "local", true, 1),
+                    space("remote-folder", "remote", false, 1),
                 ];
             });
             PullRequestsPage::new(state, cx)
@@ -4552,7 +4929,13 @@ mod tests {
         });
         cx.run_until_parked();
         assert!(cx.debug_bounds("pr-project-shared-remote").is_some());
-        for absent in ["pr-project-shared-local", "pr-project-local-only"] {
+        // Without the device's word that it reads folders, a project that is
+        // no checkout is no row either.
+        for absent in [
+            "pr-project-shared-local",
+            "pr-project-local-only",
+            "pr-project-remote-folder",
+        ] {
             assert!(cx.debug_bounds(absent).is_none(), "{absent}");
         }
         let bounds = cx.debug_bounds("pr-project-shared-remote").unwrap();
@@ -4571,6 +4954,251 @@ mod tests {
             assert_eq!(page.target_device.as_deref(), Some("remote"));
             assert_eq!(page.repository.as_deref(), Some("acme/shared"));
         });
+    }
+
+    fn presented(provider: &str) -> ChangeRequestPresentation {
+        ChangeRequestPresentation {
+            provider_name: provider.into(),
+            ..Default::default()
+        }
+    }
+
+    /// A project folder `/workspace` on this device holding three
+    /// repositories; `tools` never loads.
+    fn folder_rpc(
+        calls: std::sync::Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
+    ) -> std::sync::Arc<ScriptedRpc> {
+        ScriptedRpc::new(move |method, params| {
+            let calls = calls.clone();
+            async move {
+                calls.lock().unwrap().push((method.clone(), params.clone()));
+                match method.as_str() {
+                    methods::GET_CHANGE_REQUEST_REPOSITORIES => {
+                        assert_eq!(params["cwd"], "/workspace");
+                        let repository = |repository: &str, path: &str, provider: Option<&str>| {
+                            ChangeRequestRepository {
+                                repository: repository.into(),
+                                path: path.into(),
+                                presentation: provider.map(presented),
+                            }
+                        };
+                        zeron_rpc::RpcReply::value(&[
+                            repository("gitlab.com/acme/platform/team/api", "api", Some("GitLab")),
+                            repository("acme/web", "web", Some("GitHub")),
+                            repository("forge.test/acme/tools", "tools", Some("Forge")),
+                        ])
+                    }
+                    methods::LIST_CHANGE_REQUEST_PAGE => {
+                        assert!(params.get("repository").is_none());
+                        assert_eq!(
+                            params["repositories"],
+                            serde_json::json!([
+                                "gitlab.com/acme/platform/team/api",
+                                "acme/web",
+                                "forge.test/acme/tools"
+                            ])
+                        );
+                        let api = |number| {
+                            let mut item =
+                                pull_request("gitlab.com/acme/platform/team/api", number, 1, 1, 10);
+                            item.url = format!(
+                                "https://gitlab.com/acme/platform/team/api/-/merge_requests/{number}"
+                            );
+                            item
+                        };
+                        zeron_rpc::RpcReply::value(&match params["after"].as_str() {
+                            None => ChangeRequestPage {
+                                items: vec![pull_request("acme/web", 2, 1, 1, 12), api(1)],
+                                next_cursor: Some("Y29tYmluZWQ".into()),
+                                total_count: Some(3),
+                                errors: vec![ChangeRequestScopeError {
+                                    repository: "forge.test/acme/tools".into(),
+                                    code: capability_errors::PULL_REQUESTS_AUTHENTICATION.into(),
+                                }],
+                                ..Default::default()
+                            },
+                            Some("Y29tYmluZWQ") => ChangeRequestPage {
+                                items: vec![api(3)],
+                                ..Default::default()
+                            },
+                            other => panic!("unexpected cursor {other:?}"),
+                        })
+                    }
+                    other => panic!("unexpected request {other}"),
+                }
+            }
+        })
+    }
+
+    fn folder_engine(rpc: &std::sync::Arc<ScriptedRpc>) -> crate::state::EngineHandle {
+        crate::state::EngineHandle::from_test_client(rpc.client()).with_test_capabilities(&[
+            zeron_proto::capabilities::CHANGE_REQUESTS_HOST_SCOPES_V1,
+            zeron_proto::capabilities::CHANGE_REQUESTS_MULTI_SCOPE_V1,
+        ])
+    }
+
+    #[gpui::test]
+    fn a_project_folder_of_repositories_opens_as_one_board(cx: &mut gpui::TestAppContext) {
+        let runtime = fixture::runtime();
+        let _guard = runtime.enter();
+        let _settings = fixture::settings(cx, crate::settings::UiSettings::default());
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let rpc = folder_rpc(calls.clone());
+        let (page, cx) = cx.add_window_view(|_, cx| {
+            let state = fixture::state(cx, None);
+            state.update(cx, |state, _| {
+                state.set_test_engine(folder_engine(&rpc));
+                state.local_device_id = Some("local".into());
+                state.spaces = vec![space("workspace", "local", false, 1)];
+            });
+            PullRequestsPage::new(state, cx)
+        });
+        cx.simulate_resize(gpui::size(px(900.0), px(800.0)));
+        cx.run_until_parked();
+        page.update(cx, |page, cx| {
+            page.repository_menu.open(());
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let row = cx.debug_bounds("pr-project-workspace").unwrap();
+        cx.simulate_click(row.center(), gpui::Modifiers::default());
+        rpc.settle(cx, &runtime, |cx| {
+            page.read_with(cx, |page, _| {
+                page.load_state == PullRequestsLoadState::Ready
+            })
+        });
+        let methods_called: Vec<_> = calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(method, _)| method.clone())
+            .collect();
+        assert_eq!(
+            methods_called,
+            [
+                methods::GET_CHANGE_REQUEST_REPOSITORIES,
+                methods::LIST_CHANGE_REQUEST_PAGE
+            ]
+        );
+        page.update(cx, |page, cx| {
+            assert_eq!(page.folder.as_ref().unwrap().name, "workspace");
+            assert_eq!(page.repository.as_deref(), Some("folder:/workspace"));
+            assert_eq!(numbers(&page.items), [2, 1]);
+            assert_eq!(page.paging.total, Some(3));
+            // A folder's rows never rename the board after one repository.
+            assert_eq!(page.repository_input.read(cx).text().to_string(), "");
+            // Each row opens with its own provider's presentation.
+            let api = "https://gitlab.com/acme/platform/team/api/-/merge_requests/1";
+            assert_eq!(page.presentation_for(api).unwrap().provider_name, "GitLab");
+            let web = "https://github.com/acme/web/pull/2";
+            assert_eq!(page.presentation_for(web).unwrap().provider_name, "GitHub");
+            assert_eq!(
+                page.scope_error_summary().as_deref(),
+                Some("tools: Sign in to Forge on this device")
+            );
+            // The selection persists apart from the last repository.
+            let saved = crate::settings::current(cx);
+            assert_eq!(
+                saved.last_pull_request_folder,
+                Some(crate::settings::PullRequestFolder {
+                    path: "/workspace".into(),
+                    device: None,
+                })
+            );
+            assert_eq!(saved.last_pull_request_repository, None);
+            // Search and personal views read the merged rows.
+            page.query = "api".into();
+            page.view_items = None;
+            assert_eq!(numbers(&page.board(cx).items), [1]);
+            page.query.clear();
+            page.view_items = None;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        // Rows name their repository; the failure is one notice beside them.
+        for selector in ["pr-row-repository", "pr-scope-errors", "pull-request-row"] {
+            assert!(cx.debug_bounds(selector).is_some(), "{selector}");
+        }
+        page.update(cx, |page, cx| page.load_more(cx));
+        rpc.settle(cx, &runtime, |cx| {
+            page.read_with(cx, |page, _| {
+                page.more_task.is_none() && page.items.len() == 3
+            })
+        });
+        let (_, params) = calls.lock().unwrap().last().unwrap().clone();
+        assert_eq!(params["after"], "Y29tYmluZWQ");
+        page.read_with(cx, |page, _| {
+            assert_eq!(page.paging.next_cursor, None);
+            assert_eq!(page.paging.total, Some(3));
+            assert_eq!(page.paging.errors.len(), 1, "the notice stays");
+        });
+        // Choosing a repository replaces the folder, here and on disk.
+        page.update(cx, |page, cx| {
+            page.repository_input
+                .update(cx, |input, cx| input.set_text("acme/web", cx));
+            page.select_repository(cx);
+            assert!(page.folder.is_none());
+            assert_eq!(crate::settings::current(cx).last_pull_request_folder, None);
+        });
+    }
+
+    #[gpui::test]
+    fn a_folder_board_restores_on_its_device_and_needs_one_that_reads_folders(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let runtime = fixture::runtime();
+        let _guard = runtime.enter();
+        let _settings = fixture::settings(cx, {
+            let mut settings = crate::settings::UiSettings::default();
+            settings.last_pull_request_repository = Some("acme/older".into());
+            settings.last_pull_request_folder = Some(crate::settings::PullRequestFolder {
+                path: "/workspace".into(),
+                device: None,
+            });
+            settings
+        });
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let rpc = folder_rpc(calls.clone());
+        let (page, cx) = cx.add_window_view(|_, cx| {
+            let state = fixture::state(cx, None);
+            state.update(cx, |state, _| {
+                state.set_test_engine(folder_engine(&rpc));
+                state.local_device_id = Some("local".into());
+                let mut older = device("older", "macos");
+                older.last_seen_at = Some(Utc::now());
+                state.devices = vec![device("local", "macos"), older];
+                state.spaces = vec![space("workspace", "local", false, 1)];
+            });
+            PullRequestsPage::new(state, cx)
+        });
+        rpc.settle(cx, &runtime, |cx| {
+            page.read_with(cx, |page, _| {
+                page.load_state == PullRequestsLoadState::Ready
+            })
+        });
+        page.update(cx, |page, cx| {
+            assert_eq!(page.repository.as_deref(), Some("folder:/workspace"));
+            assert_eq!(numbers(&page.items), [2, 1]);
+            // A device that reads one repository at a time is never sent
+            // the folder's.
+            page.set_target_device(Some("older".into()), cx);
+            page.load(false, cx);
+            assert_eq!(
+                page.load_state,
+                PullRequestsLoadState::Failed(PullRequestsPageError::FoldersUnsupported(
+                    "older".into()
+                ))
+            );
+        });
+        assert_eq!(
+            calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(method, _)| method == methods::LIST_CHANGE_REQUEST_PAGE)
+                .count(),
+            1
+        );
     }
 
     #[gpui::test]
