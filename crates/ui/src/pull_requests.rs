@@ -3965,6 +3965,7 @@ mod tests {
                     total_count: None,
                     fetched_at: None,
                     presentation: None,
+                    errors: Vec::new(),
                 })
             }
         });
@@ -4209,6 +4210,7 @@ mod tests {
                             total_count: Some(1),
                             fetched_at: None,
                             presentation: None,
+                            errors: Vec::new(),
                         })
                     }
                     _ => panic!("unexpected request {method}"),
@@ -4257,6 +4259,7 @@ mod tests {
                                 total_count: Some(1),
                                 fetched_at: None,
                                 presentation: None,
+                                errors: Vec::new(),
                             })
                         }
                         other => panic!("unexpected request {other}"),
@@ -4528,6 +4531,7 @@ mod tests {
                             total_count: Some(1),
                             fetched_at: None,
                             presentation: None,
+                            errors: Vec::new(),
                         })
                     }
                     _ => panic!("unexpected request {method}"),
@@ -5290,6 +5294,7 @@ mod tests {
                         total_count: Some(1),
                         fetched_at: None,
                         presentation: None,
+                        errors: Vec::new(),
                     });
                 }
                 match after.as_deref() {
@@ -5301,6 +5306,7 @@ mod tests {
                         total_count: Some(52),
                         fetched_at: None,
                         presentation: None,
+                        errors: Vec::new(),
                     }),
                     Some("Y3Vyc29yOjUw") => zeron_rpc::RpcReply::value(&ChangeRequestPage {
                         // #50 moved onto the second page; it must not repeat.
@@ -5311,6 +5317,7 @@ mod tests {
                         total_count: Some(52),
                         fetched_at: None,
                         presentation: None,
+                        errors: Vec::new(),
                     }),
                     other => panic!("unexpected cursor {other:?}"),
                 }
@@ -5482,6 +5489,7 @@ mod tests {
                             Utc::now()
                         }),
                         presentation: None,
+                        errors: Vec::new(),
                     })
                 }
             })

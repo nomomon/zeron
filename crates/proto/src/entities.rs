@@ -935,6 +935,37 @@ pub struct ChangeRequestPage {
     /// older engines.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub presentation: Option<ChangeRequestPresentation>,
+    /// On a page combining several repositories, the ones whose rows
+    /// didn't load; the rest of the page did. Empty otherwise, and absent
+    /// from older engines.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<ChangeRequestScopeError>,
+}
+
+/// One repository missing from a combined page, and why.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ChangeRequestScopeError {
+    /// The scope as the request named it.
+    pub repository: String,
+    /// The failure's stable code, as a single repository's page reports it
+    /// (`zeron_rpc::capability_errors`).
+    pub code: String,
+}
+
+/// One repository in a project folder, as `GetChangeRequestRepositories`
+/// reports it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ChangeRequestRepository {
+    /// The board's scope for it, as `ListChangeRequestPage` takes it.
+    pub repository: String,
+    /// The checkout's folder relative to the project; empty for the project
+    /// folder itself.
+    pub path: String,
+    /// How clients present its provider.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presentation: Option<ChangeRequestPresentation>,
 }
 
 /// What clients can do with one provider's change requests in place.
@@ -1663,6 +1694,51 @@ mod tests {
         // Absent from older engines, every field reads as empty.
         let page: ChangeRequestPage = serde_json::from_value(serde_json::json!({})).unwrap();
         assert_eq!(page.presentation, None);
+        assert!(page.errors.is_empty());
+    }
+
+    #[test]
+    fn combined_pages_and_folder_repositories_stay_optional_on_the_wire() {
+        // A single repository's page says nothing new.
+        let value = serde_json::to_value(ChangeRequestPage::default()).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"items": [], "nextCursor": null, "totalCount": null})
+        );
+        let page = ChangeRequestPage {
+            errors: vec![ChangeRequestScopeError {
+                repository: "gitlab.com/acme/platform/team/api".into(),
+                code: "pull_requests.authentication".into(),
+            }],
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&page).unwrap();
+        assert_eq!(
+            value["errors"],
+            serde_json::json!([{
+                "repository": "gitlab.com/acme/platform/team/api",
+                "code": "pull_requests.authentication"
+            }])
+        );
+        assert_eq!(
+            serde_json::from_value::<ChangeRequestPage>(value).unwrap(),
+            page
+        );
+
+        let repository = ChangeRequestRepository {
+            repository: "acme/web".into(),
+            path: "web".into(),
+            presentation: None,
+        };
+        let value = serde_json::to_value(&repository).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"repository": "acme/web", "path": "web"})
+        );
+        let bare: ChangeRequestRepository =
+            serde_json::from_value(serde_json::json!({"repository": "acme/web"})).unwrap();
+        assert_eq!(bare.repository, "acme/web");
+        assert!(bare.path.is_empty() && bare.presentation.is_none());
     }
 
     #[test]

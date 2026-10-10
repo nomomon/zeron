@@ -37,6 +37,8 @@ pub(crate) const CLI_TIMEOUT: Duration = Duration::from_secs(20);
 const GIT_OUTPUT_LIMIT: usize = 64 * 1024;
 /// `ssh -G` only reads configuration; it never connects.
 const SSH_CONFIG_TIMEOUT: Duration = Duration::from_secs(3);
+/// Checkouts read from one project folder; each costs a few Git reads.
+pub(crate) const FOLDER_CHECKOUT_LIMIT: usize = 32;
 /// `repository()` follows renames: the old name resolves to the current one.
 const GITHUB_REPOSITORY_QUERY: &str = "query($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { nameWithOwner } }";
 pub(crate) const CLI_OUTPUT_LIMIT: usize = 1024 * 1024;
@@ -137,6 +139,23 @@ pub enum ChangeRequestError {
     CommandFailed,
 }
 
+impl ChangeRequestError {
+    /// The stable code clients read for this failure; never command output.
+    pub(crate) fn code(self) -> &'static str {
+        use zeron_rpc::capability_errors;
+        match self {
+            Self::CliUnavailable => capability_errors::PULL_REQUESTS_CLI_UNAVAILABLE,
+            Self::Authentication => capability_errors::PULL_REQUESTS_AUTHENTICATION,
+            Self::RateLimited => capability_errors::PULL_REQUESTS_RATE_LIMITED,
+            Self::Timeout => capability_errors::PULL_REQUESTS_TIMEOUT,
+            Self::Decode => capability_errors::PULL_REQUESTS_DECODE,
+            Self::RepositoryUnavailable | Self::UnsupportedRepository | Self::CommandFailed => {
+                capability_errors::PULL_REQUESTS_COMMAND_FAILED
+            }
+        }
+    }
+}
+
 /// Checkout inspection plus provider resolution, injectable for cache/service tests.
 #[async_trait]
 pub trait CheckoutChangeRequestLookup: Send + Sync {
@@ -202,6 +221,45 @@ impl ChangeRequestResolver {
             }
         };
         self.remote_scope(&remote_url).await
+    }
+
+    /// The repositories a project folder holds, each with its folder
+    /// relative to `root`. A checkout is its own repository, exactly as
+    /// [`Self::scope_for_checkout`] reads it. Any other folder is a
+    /// workspace of sibling checkouts: each one directly inside it counts,
+    /// in name order, unless no adapter serves its remote. Local only.
+    pub(crate) async fn scopes_in_folder(&self, root: &Path) -> Vec<(String, ChangeRequestScope)> {
+        if self
+            .inspector
+            .git_optional(root, &["rev-parse", "--is-inside-work-tree"])
+            .await
+            .as_deref()
+            == Some("true")
+        {
+            return self
+                .scope_for_checkout(root)
+                .await
+                .map(|scope| (String::new(), scope))
+                .into_iter()
+                .collect();
+        }
+        let children = checkouts_in_folder(root).await;
+        let scopes = futures::future::join_all(
+            children
+                .iter()
+                .map(|child| async move { self.scope_for_checkout(&root.join(child)).await }),
+        )
+        .await;
+        let mut found: Vec<(String, ChangeRequestScope)> = Vec::new();
+        for (child, scope) in children.into_iter().zip(scopes) {
+            // A second clone, or a link to the same checkout, adds nothing.
+            if let Some(scope) = scope
+                && !found.iter().any(|(_, seen)| seen.same_repository(&scope))
+            {
+                found.push((child, scope));
+            }
+        }
+        found
     }
 
     /// Match a PR's repository against every fetch remote. A fork's origin
@@ -354,6 +412,39 @@ impl CheckoutChangeRequestLookup for ChangeRequestResolver {
     ) -> Result<Option<ChangeRequestSummary>, ChangeRequestError> {
         ChangeRequestResolver::resolve_source(self, source).await
     }
+}
+
+/// The checkouts directly inside `root`, by name, at most
+/// [`FOLDER_CHECKOUT_LIMIT`]. Hidden folders and `node_modules` are never
+/// projects of their own, and a link counts only while it stays in `root`.
+async fn checkouts_in_folder(root: &Path) -> Vec<String> {
+    let root = root.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let Ok(real_root) = std::fs::canonicalize(&root) else {
+            return Vec::new();
+        };
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> = entries
+            .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+            .filter(|name| !name.starts_with('.') && name != "node_modules")
+            .collect();
+        names.sort();
+        names
+            .into_iter()
+            .filter(|name| {
+                let path = root.join(name);
+                std::fs::canonicalize(&path)
+                    .is_ok_and(|real| real.starts_with(&real_root) && real.is_dir())
+                    // A worktree's or submodule's `.git` is a file.
+                    && path.join(".git").exists()
+            })
+            .take(FOLDER_CHECKOUT_LIMIT)
+            .collect()
+    })
+    .await
+    .unwrap_or_default()
 }
 
 /// GitHub provider backed by the host's existing `gh` installation and auth.
@@ -865,6 +956,7 @@ impl GitHubCli {
                 total_count: response.data.search.issue_count,
                 fetched_at: Some(Utc::now()),
                 presentation: None,
+                errors: Vec::new(),
             },
             canonical,
         ))
@@ -2665,6 +2757,145 @@ mod tests {
         assert!(!requests[8].args.iter().any(|arg| arg.contains(body)));
     }
 
+    /// A project folder that is no checkout lists the checkouts inside it,
+    /// one level down, over the real engine dispatch. Only local Git runs.
+    #[tokio::test]
+    async fn project_folders_list_the_checkouts_inside_them() {
+        use serde_json::json;
+        use zeron_proto::ChangeRequestRepository;
+        use zeron_rpc::methods;
+
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let checkout = |name: &str, remote: Option<&str>| {
+            let path = workspace.join(name);
+            std::fs::create_dir_all(&path).unwrap();
+            run_git(&path, &["init", "--quiet"]);
+            if let Some(remote) = remote {
+                run_git(&path, &["remote", "add", "origin", remote]);
+            }
+            path
+        };
+        let api = checkout("api", Some("git@gitlab.com:acme/platform/team/api.git"));
+        checkout("web", Some("https://github.com/acme/web.git"));
+        checkout("tools", None);
+        // No adapter serves this host.
+        checkout("vendor", Some("https://git.example.net/acme/vendor.git"));
+        // A second clone of api adds nothing.
+        checkout(
+            "zz-api-copy",
+            Some("https://gitlab.com/acme/platform/team/api.git"),
+        );
+        checkout(
+            ".cache",
+            Some("git@gitlab.com:acme/platform/team/hidden.git"),
+        );
+        checkout(
+            "node_modules",
+            Some("https://github.com/acme/dependency.git"),
+        );
+        std::fs::create_dir(workspace.join("docs")).unwrap();
+        std::fs::write(workspace.join("notes.md"), "").unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        run_git(&outside, &["init", "--quiet"]);
+        run_git(
+            &outside,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/acme/outside.git",
+            ],
+        );
+        #[cfg(unix)]
+        {
+            // Links count only while they stay inside the project.
+            std::os::unix::fs::symlink(&outside, workspace.join("escape")).unwrap();
+            std::os::unix::fs::symlink(&api, workspace.join("api-link")).unwrap();
+        }
+        let core = crate::EngineCore::assemble(
+            &dir.path().join("engine"),
+            Arc::new(crate::HarnessRegistry::new()),
+            zeron_proto::HarnessId::Mock,
+            None,
+        )
+        .unwrap();
+        for (id, path, git) in [
+            ("space-workspace", &workspace, false),
+            ("space-api", &api, true),
+        ] {
+            core.workspace
+                .create_space(id, &core.device_id, &path.to_string_lossy(), None, git)
+                .unwrap();
+        }
+        let rpc = Arc::try_unwrap(core.rpc_service()).ok().unwrap();
+        let client = zeron_rpc::memory_client(Arc::new(rpc));
+        let client = &client;
+        let device = core.device_id.as_str();
+        let list = move |cwd: &Path| {
+            client.call_as::<Vec<ChangeRequestRepository>>(
+                methods::GET_CHANGE_REQUEST_REPOSITORIES,
+                json!({"cwd": cwd, "targetDeviceId": device}),
+            )
+        };
+        let found = |repositories: Vec<ChangeRequestRepository>| {
+            repositories
+                .into_iter()
+                .map(|found| {
+                    (
+                        found.repository,
+                        found.path,
+                        found
+                            .presentation
+                            .map(|presentation| presentation.provider_name),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let row = |repository: &str, path: &str, provider: &str| {
+            (
+                repository.to_owned(),
+                path.to_owned(),
+                Some(provider.to_owned()),
+            )
+        };
+        assert_eq!(
+            found(list(&workspace).await.unwrap()),
+            [
+                row("gitlab.com/acme/platform/team/api", "api", "GitLab"),
+                row("acme/web", "web", "GitHub"),
+            ]
+        );
+        // A checkout is its own repository, nested folders aside.
+        checkout("api/plugins", Some("https://github.com/acme/plugins.git"));
+        assert_eq!(
+            found(list(&api).await.unwrap()),
+            [row("gitlab.com/acme/platform/team/api", "", "GitLab")]
+        );
+        // Only folders a project or chat names are read, never their
+        // parents or their siblings.
+        for cwd in [&outside, dir.path()] {
+            assert!(list(cwd).await.is_err(), "{}", cwd.display());
+        }
+        // A combined page reads only scopes the board names, and a page
+        // names at least one.
+        for params in [
+            json!({"repositories": ["acme/web", "not a scope"]}),
+            json!({"repositories": vec!["acme/web"; 33]}),
+            json!({"filter": "all"}),
+        ] {
+            let result = client.call(methods::LIST_CHANGE_REQUEST_PAGE, params).await;
+            // The in-memory transport carries the class in the message.
+            assert!(
+                result
+                    .as_ref()
+                    .is_err_and(|error| error.to_string().contains("bad params")),
+                "{result:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn pr_known_revision_bypasses_recent_detail_cache_and_pins_diff() {
         use serde_json::json;
@@ -2737,9 +2968,8 @@ mod tests {
 
     #[tokio::test]
     async fn ssh_alias_remote_matches_through_ssh_config() {
-        let runner = FakeProcessRunner::with_responses([command_success(
-            "user git\nhostname github.com\n",
-        )]);
+        let runner =
+            FakeProcessRunner::with_responses([command_success("user git\nhostname github.com\n")]);
         let resolver = ChangeRequestResolver {
             inspector: GitCheckoutInspector::new(runner.clone()),
             providers: board(runner.clone()),
