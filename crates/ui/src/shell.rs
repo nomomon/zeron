@@ -18400,6 +18400,14 @@ mod settings_modal_regressions {
         shell.read_with(cx, |shell, _| {
             assert_eq!(shell.route, Route::Settings(SettingsSection::Devices));
         });
+        devices.update(cx, |page, cx| page.open_forget("device-1".into(), cx));
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear());
+        cx.simulate_keystrokes("escape");
+        assert!(!devices.update(cx, |page, cx| page.dismiss_on_escape(cx)));
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(shell.route, Route::Settings(SettingsSection::Devices));
+        });
 
         // So does the account menu opened from the settings footer.
         shell.update(cx, |shell, cx| {

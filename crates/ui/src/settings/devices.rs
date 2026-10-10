@@ -1,6 +1,7 @@
 //! Settings → Devices (feature-inventory §1.5): the device registry — name,
 //! platform, last-seen, an Online/Offline badge, a "This device" badge, click-to-copy id,
-//! and a Rename dialog (Mutate renameDevice).
+//! a Rename dialog (Mutate renameDevice), and a Forget dialog for offline devices
+//! (Mutate forgetDevice).
 
 use chrono::{DateTime, Utc};
 use gpui::{
@@ -55,6 +56,36 @@ pub fn devices_subtitle(scope: Option<WorkspaceScope>) -> &'static str {
     }
 }
 
+/// "Forget…" sits on another device's row while it is offline, and only when
+/// the local engine understands `forgetDevice`. Pure.
+pub fn forget_offered(is_local: bool, online: bool, engine_supports: bool) -> bool {
+    !is_local && !online && engine_supports
+}
+
+fn count_noun(count: usize, noun: &str) -> String {
+    if count == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{count} {noun}s")
+    }
+}
+
+/// Why `name` can't be forgotten yet, given its `(projects, sessions)`
+/// ([`zeron_proto::device_holdings`]); `None` when nothing pins it. Pure.
+pub fn forget_refusal(name: &str, (projects, sessions): (usize, usize)) -> Option<String> {
+    let held: Vec<String> = [(projects, "project"), (sessions, "session")]
+        .into_iter()
+        .filter(|(count, _)| *count > 0)
+        .map(|(count, noun)| count_noun(count, noun))
+        .collect();
+    (!held.is_empty()).then(|| {
+        format!(
+            "“{name}” still has {}. Remove them first, then forget the device.",
+            held.join(" and ")
+        )
+    })
+}
+
 struct RenameDialog {
     device_id: String,
     input: Entity<ComposerInput>,
@@ -65,6 +96,8 @@ pub struct DevicesPage {
     state: Entity<AppState>,
     scroll: widgets::PageScroll,
     rename: Option<RenameDialog>,
+    /// Device id the Forget dialog is open for.
+    forget: Option<String>,
     /// Device id whose id-chip shows "Copied" right now.
     copied: Option<String>,
     error: Option<SharedString>,
@@ -80,6 +113,7 @@ impl DevicesPage {
             state,
             scroll: widgets::PageScroll::default(),
             rename: None,
+            forget: None,
             copied: None,
             error: None,
             task: None,
@@ -109,10 +143,15 @@ impl DevicesPage {
         cx.notify();
     }
 
-    /// Escape that reached Settings unclaimed closes the rename dialog first,
+    pub(crate) fn open_forget(&mut self, device_id: String, cx: &mut Context<Self>) {
+        self.forget = Some(device_id);
+        cx.notify();
+    }
+
+    /// Escape that reached Settings unclaimed closes an open dialog first,
     /// so it never closes Settings under the dialog. Returns whether it did.
     pub(crate) fn dismiss_on_escape(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.rename.take().is_none() {
+        if self.rename.take().is_none() && self.forget.take().is_none() {
             return false;
         }
         cx.notify();
@@ -141,6 +180,25 @@ impl DevicesPage {
             this.update(cx, |page, cx| {
                 if let Err(err) = result {
                     page.error = Some(format!("Rename failed: {err}").into());
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    fn forget_device(&mut self, device_id: String, cx: &mut Context<Self>) {
+        self.forget = None;
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let params = serde_json::json!({ "op": "forgetDevice", "deviceId": device_id });
+        self.task = Some(cx.spawn(async move |this, cx| {
+            let result = engine.client().call(methods::MUTATE, params).await;
+            this.update(cx, |page, cx| {
+                if let Err(err) = result {
+                    page.error = Some(format!("Forget failed: {err}").into());
                 }
                 cx.notify();
             })
@@ -221,6 +279,77 @@ impl DevicesPage {
         Some(popover::modal("rename-device-dialog", viewport, card))
     }
 
+    /// The project "Remove…" confirm, for a device. While the device still
+    /// hosts projects or sessions it explains what to remove instead.
+    fn render_forget_dialog(
+        &mut self,
+        viewport: gpui::Size<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let theme = Theme::of(cx).for_popup();
+        let device_id = self.forget.clone()?;
+        let (name, holdings) = {
+            let state = self.state.read(cx);
+            (
+                state.device_name(&device_id)?.to_string(),
+                zeron_proto::device_holdings(&device_id, &state.spaces, &state.chats),
+            )
+        };
+        let refusal = forget_refusal(&name, holdings);
+        let (title, copy) = match &refusal {
+            Some(refusal) => ("Can’t forget device yet", refusal.clone()),
+            None => (
+                "Forget device?",
+                format!(
+                    "Forgetting “{name}” removes it from Devices on all your devices. If it runs Zeron again, it reappears."
+                ),
+            ),
+        };
+        let buttons = div()
+            .mt(px(16.0))
+            .flex()
+            .flex_row()
+            .justify_end()
+            .gap(px(8.0))
+            .child(
+                popover::btn_ghost(
+                    &theme,
+                    if refusal.is_some() { "Close" } else { "Cancel" },
+                    "forget-device-cancel",
+                )
+                .id("forget-device-cancel")
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.forget = None;
+                    cx.notify();
+                })),
+            )
+            .when(refusal.is_none(), |el| {
+                el.child(
+                    popover::btn_danger(&theme, "Forget")
+                        .id("forget-device-confirm")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.forget_device(device_id.clone(), cx)
+                        })),
+                )
+            });
+        let card = popover::dialog_card(&theme)
+            .id("forget-device-card")
+            .role(gpui::Role::Dialog)
+            .aria_label(title)
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                if event.keystroke.key == "escape" {
+                    this.forget = None;
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+            }))
+            .child(popover::dialog_title(&theme, title))
+            .child(div().mt(px(6.0)).child(popover::dialog_body(&theme, copy)))
+            .child(buttons)
+            .into_any_element();
+        Some(popover::modal("forget-device-dialog", viewport, card))
+    }
+
     fn on_scroll_hovered(&mut self, hovered: &bool, _: &mut Window, cx: &mut Context<Self>) {
         if self.scroll.set_list_hovered(*hovered) {
             cx.notify();
@@ -265,16 +394,23 @@ impl Render for DevicesPage {
         crate::toast::take_error(&mut self.error, cx);
         let theme = Theme::of(cx).for_settings_surface();
         let now = Utc::now();
-        let (devices, local_id, workspace_scope) = {
+        let (devices, local_id, workspace_scope, can_forget) = {
             let state = self.state.read(cx);
             (
                 state.devices.clone(),
                 state.local_device_id.clone(),
                 state.workspace_scope,
+                state.engine().is_some_and(|engine| {
+                    engine
+                        .engine_info()
+                        .supports(zeron_proto::capabilities::FORGET_DEVICE_V1)
+                }),
             )
         };
         let copied = self.copied.clone();
-        let dialog = self.render_rename_dialog(window.viewport_size(), cx);
+        let dialog = self
+            .render_rename_dialog(window.viewport_size(), cx)
+            .or_else(|| self.render_forget_dialog(window.viewport_size(), cx));
         // Split into this device and the rest; each renders as rows in one
         // block, like every other settings page.
         let (local, others): (Vec<_>, Vec<_>) = devices
@@ -288,6 +424,8 @@ impl Render for DevicesPage {
             let copy_id = device.id.clone();
             let rename_id = device.id.clone();
             let rename_name = device.name.clone();
+            let forget_id = device.id.clone();
+            let offer_forget = forget_offered(is_local, online, can_forget);
             let mut meta: Vec<AnyElement> = vec![
                 div()
                     .child(SharedString::from(
@@ -349,6 +487,19 @@ impl Render for DevicesPage {
                                 },
                             )),
                         )
+                        .when(offer_forget, |el| {
+                            el.child(
+                                widgets::text_action(&theme, widgets::ActionTone::Quiet, "Forget…")
+                                    .id(("device-forget", ix))
+                                    .tab_index(0)
+                                    .role(gpui::Role::Button)
+                                    .aria_label(format!("Forget {}", device.name))
+                                    .focus_visible(|s| s.border_2().border_color(theme.accent))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.open_forget(forget_id.clone(), cx);
+                                    })),
+                            )
+                        })
                         .child(
                             widgets::text_action(&theme, widgets::ActionTone::Filled, "Rename")
                                 .id(("device-rename", ix))
@@ -470,6 +621,85 @@ mod tests {
             format_last_seen(Some(now - TimeDelta::days(2)), now),
             "2d ago"
         );
+    }
+
+    #[test]
+    fn forget_is_offered_only_for_offline_peers_on_a_capable_engine() {
+        assert!(forget_offered(false, false, true));
+        // Never for this device, even when the engine supports it.
+        assert!(!forget_offered(true, false, true));
+        // Never while the device is online.
+        assert!(!forget_offered(false, true, true));
+        // An older local engine has no forgetDevice op.
+        assert!(!forget_offered(false, false, false));
+    }
+
+    #[test]
+    fn forget_refuses_with_counts_while_the_device_hosts_anything() {
+        let space = |id: &str, device: &str| zeron_proto::Space {
+            id: id.into(),
+            device_id: device.into(),
+            path: format!("/tmp/{id}"),
+            name: None,
+            git_detected: false,
+            git_checked_at: None,
+            checkout_id: None,
+            repository_id: None,
+            created_at: Utc::now(),
+        };
+        let chat = |id: &str, device: &str| zeron_proto::Chat {
+            id: id.into(),
+            device_id: device.into(),
+            title: None,
+            archived: false,
+            cwd: None,
+            branch: None,
+            checkout_id: None,
+            source_context: None,
+            config: None,
+            last_message_preview: None,
+            last_message_at: None,
+            created_at: Utc::now(),
+            harness_session_id: None,
+            harness_session_cwd: None,
+            parent_chat_id: None,
+            space_id: None,
+            last_seen_at: None,
+            room_gen: None,
+        };
+        let spaces = vec![
+            space("sp-1", "old-laptop"),
+            space("sp-2", "old-laptop"),
+            space("sp-3", "desk"),
+        ];
+        let mut archived = chat("c-archived", "old-laptop");
+        archived.archived = true;
+        let mut side = chat("c-side", "old-laptop");
+        side.parent_chat_id = Some("c-1".into());
+        let chats = vec![
+            chat("c-1", "old-laptop"),
+            archived,
+            side,
+            chat("c-2", "desk"),
+        ];
+
+        let holdings = zeron_proto::device_holdings("old-laptop", &spaces, &chats);
+        assert_eq!(holdings, (2, 1));
+        assert_eq!(
+            forget_refusal("old-laptop", holdings).as_deref(),
+            Some(
+                "“old-laptop” still has 2 projects and 1 session. Remove them first, then forget the device."
+            )
+        );
+        assert_eq!(
+            forget_refusal("old-laptop", (0, 3)).as_deref(),
+            Some("“old-laptop” still has 3 sessions. Remove them first, then forget the device.")
+        );
+        assert_eq!(
+            zeron_proto::device_holdings("old-laptop", &[], &chats[1..3]),
+            (0, 0)
+        );
+        assert_eq!(forget_refusal("old-laptop", (0, 0)), None);
     }
 
     #[test]
