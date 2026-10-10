@@ -107,6 +107,7 @@ impl ChangeRequestStore {
                 next_cursor,
                 total_count: total_count.and_then(|count| u64::try_from(count).ok()),
                 fetched_at: Utc.timestamp_millis_opt(fetched_at).single(),
+                presentation: None,
             })
         })
     }
@@ -337,6 +338,7 @@ mod tests {
             mergeability: ChangeRequestMergeability::Unknown,
             created_at: DateTime::UNIX_EPOCH,
             updated_at: DateTime::UNIX_EPOCH,
+            reference: None,
         }
     }
 
@@ -346,6 +348,7 @@ mod tests {
             items,
             next_cursor: Some("Y3Vyc29yOjUw".into()),
             fetched_at: Some(fetched_at),
+            presentation: None,
         }
     }
 
