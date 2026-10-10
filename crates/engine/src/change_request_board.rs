@@ -1,14 +1,16 @@
-//! Provider routing for the pull request board.
+//! Provider routing, storage and caching for the pull request board.
 //!
 //! The board speaks in scopes (a repository on a host) and change request
 //! URLs; an adapter per provider turns those into CLI calls. Routing lives
 //! here so RPC handlers never name a provider: the registry reads a wire
 //! scope, finds the adapter serving its host, and that adapter alone decides
-//! whether the path names one of its repositories.
+//! whether the path names one of its repositories. Adapters only fetch;
+//! how fresh an answer must be, what is shared between callers, and what
+//! is kept on disk is the registry's policy, the same for every provider.
 
-use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use zeron_proto::{
@@ -34,8 +36,9 @@ pub(crate) trait ChangeRequestBoardProvider: Send + Sync {
     /// repositories. Only asked for hosts the adapter serves.
     fn scope(&self, host: &str, path: &str) -> Option<ChangeRequestScope>;
 
-    /// Whether `url` names a change request this adapter can open.
-    fn owns_url(&self, url: &str) -> bool;
+    /// The canonical form of `url`, when it names a change request this
+    /// adapter can open. Caches key on it, so spellings share an entry.
+    fn change_request_url(&self, url: &str) -> Option<String>;
 
     /// How clients name and show this provider, sent with its pages and
     /// details so no client has to know it.
@@ -46,33 +49,38 @@ pub(crate) trait ChangeRequestBoardProvider: Send + Sync {
     /// included, so rows stored by an older build read the same.
     fn present(&self, _item: &mut ChangeRequestListItem) {}
 
-    /// The signed-in account the on-disk store keys pages by, read locally.
-    /// Each adapter namespaces its own keys. `None` when it can't be told,
-    /// and then nothing is stored.
-    async fn account_key(&self) -> Option<String>;
+    /// The account signed in on `host`, read locally, that stored pages are
+    /// kept under. Namespaced by the adapter, so two providers never share
+    /// a key. `None` when it can't be told, and then nothing is stored.
+    async fn account_key(&self, host: &str) -> Option<String>;
 
-    /// The provider's current name for `scope`, following renames.
-    async fn canonical_scope(&self, scope: &ChangeRequestScope) -> Option<ChangeRequestScope>;
+    /// The provider's current name for `scope`, following renames; `None`
+    /// when the provider answered that it has no such repository.
+    async fn canonical_scope(
+        &self,
+        scope: &ChangeRequestScope,
+    ) -> Result<Option<ChangeRequestScope>, ChangeRequestError>;
 
+    /// One page of open change requests, newest updates first, read from
+    /// the provider now.
     async fn list_page(
         &self,
         scope: &ChangeRequestScope,
         filter: ChangeRequestFilter,
         after: Option<&str>,
-        refresh: bool,
-        cached: bool,
     ) -> Result<ChangeRequestPage, ChangeRequestError>;
 
-    /// The detail, or with `diff` the patch, as the wire value.
+    /// The detail, or with `diff` the patch, as the wire value. `head` and
+    /// `base` pin the revision a client observed.
     async fn change_request(
         &self,
         url: &str,
         diff: bool,
-        refresh: bool,
         head: Option<&str>,
         base: Option<&str>,
     ) -> Result<serde_json::Value, ChangeRequestError>;
 
+    /// Explicit user submission only. Never retried.
     async fn post_comment(
         &self,
         url: &str,
@@ -80,40 +88,208 @@ pub(crate) trait ChangeRequestBoardProvider: Send + Sync {
     ) -> Result<ChangeRequestComment, ChangeRequestError>;
 }
 
-/// The board's adapters, picked by host or URL. Trait objects rather than an
-/// enum: adapters are injected in tests like the process runner, and a
-/// self-hosted provider is data (its host), not a new variant.
+/// Page cursors are short opaque tokens. Anything else is rejected before
+/// it reaches a provider.
+pub(crate) fn valid_page_cursor(cursor: &str) -> bool {
+    (1..=256).contains(&cursor.len())
+        && cursor
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"+/=_-:".contains(&b))
+}
+
+type RequestResult = Result<serde_json::Value, ChangeRequestError>;
+type RequestFetch = futures::future::Shared<futures::future::BoxFuture<'static, RequestResult>>;
+
+/// One adapter's recent answers. Simultaneous identical reads share one
+/// provider call; distinct reads run side by side. A read runs detached, so
+/// it completes and is cached even when every caller has gone away. Never
+/// retry here.
+#[derive(Clone, Default)]
+pub(crate) struct RequestCache(Arc<tokio::sync::Mutex<RequestCacheState>>);
+
+#[derive(Default)]
+pub(crate) struct RequestCacheState {
+    pub(crate) entries: Vec<(String, Instant, RequestResult)>,
+    /// Reads awaiting the provider, joined by identical requests. The id
+    /// tells a finishing read whether a write has replaced or dropped it
+    /// meanwhile.
+    pub(crate) in_flight: std::collections::HashMap<String, (u64, RequestFetch)>,
+    next_fetch: u64,
+    rate_limited_at: Option<Instant>,
+}
+
+impl RequestCache {
+    async fn request<F>(&self, key: String, refresh: bool, fetch: F) -> RequestResult
+    where
+        F: std::future::Future<Output = RequestResult> + Send + 'static,
+    {
+        use futures::FutureExt;
+        let mut cache = self.0.lock().await;
+        if let Some(index) = cache.entries.iter().position(|entry| entry.0 == key) {
+            let entry = cache.entries.remove(index);
+            let ttl = match &entry.2 {
+                Err(ChangeRequestError::RateLimited) => Duration::from_secs(15 * 60),
+                // An explicit retry always reaches the provider again.
+                Err(_) if refresh => Duration::ZERO,
+                Err(_) => Duration::from_secs(60),
+                Ok(_) if refresh => Duration::from_secs(15),
+                Ok(_) => Duration::from_secs(5 * 60),
+            };
+            let fresh = entry.1.elapsed() < ttl;
+            let result = entry.2.clone();
+            cache.entries.push(entry);
+            if fresh {
+                return result;
+            }
+        }
+        if cache
+            .rate_limited_at
+            .is_some_and(|at| at.elapsed() < Duration::from_secs(15 * 60))
+        {
+            return Err(ChangeRequestError::RateLimited);
+        }
+        let pending = match cache.in_flight.get(&key) {
+            Some((_, pending)) => pending.clone(),
+            None => {
+                let id = cache.next_fetch;
+                cache.next_fetch += 1;
+                let shared = self.0.clone();
+                let task_key = key.clone();
+                let task = tokio::spawn(async move {
+                    let result = std::panic::AssertUnwindSafe(fetch)
+                        .catch_unwind()
+                        .await
+                        .unwrap_or(Err(ChangeRequestError::CommandFailed));
+                    let mut cache = shared.lock().await;
+                    if matches!(result, Err(ChangeRequestError::RateLimited)) {
+                        cache.rate_limited_at = Some(Instant::now());
+                    }
+                    if cache
+                        .in_flight
+                        .get(&task_key)
+                        .is_some_and(|(current, _)| *current == id)
+                    {
+                        cache.in_flight.remove(&task_key);
+                        cache.entries.retain(|entry| entry.0 != task_key);
+                        cache
+                            .entries
+                            .push((task_key, Instant::now(), result.clone()));
+                        if cache.entries.len() > 24 {
+                            let _ = cache.entries.remove(0);
+                        }
+                    }
+                    result
+                });
+                let pending =
+                    async move { task.await.unwrap_or(Err(ChangeRequestError::CommandFailed)) }
+                        .boxed()
+                        .shared();
+                cache.in_flight.insert(key, (id, pending.clone()));
+                pending
+            }
+        };
+        drop(cache);
+        pending.await
+    }
+
+    /// Drop every answer, and every read in flight, whose key starts with
+    /// `prefix`: a read already in flight may predate a write.
+    async fn evict(&self, prefix: &str) {
+        let mut cache = self.0.lock().await;
+        cache.entries.retain(|entry| !entry.0.starts_with(prefix));
+        cache
+            .in_flight
+            .retain(|entry, _| !entry.starts_with(prefix));
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn state(&self) -> tokio::sync::MutexGuard<'_, RequestCacheState> {
+        self.0.lock().await
+    }
+}
+
+/// An adapter and its cache: rate limits and answers are per provider.
+#[derive(Clone)]
+struct Registered {
+    adapter: Arc<dyn ChangeRequestBoardProvider>,
+    requests: RequestCache,
+}
+
+impl Registered {
+    fn new(adapter: Arc<dyn ChangeRequestBoardProvider>) -> Self {
+        Self {
+            adapter,
+            requests: RequestCache::default(),
+        }
+    }
+}
+
+/// The board's adapters, picked by host or URL, with the store and caches
+/// they share. Trait objects rather than an enum: adapters are injected in
+/// tests like the process runner, and a self-hosted provider is data (its
+/// host), not a new variant.
 #[derive(Clone)]
 pub(crate) struct ChangeRequestBoardProviders {
-    adapters: Vec<Arc<dyn ChangeRequestBoardProvider>>,
+    adapters: Vec<Registered>,
+    /// The board's on-disk first pages. `None` keeps everything in memory
+    /// (tests).
+    store: Option<ChangeRequestStore>,
 }
 
 impl ChangeRequestBoardProviders {
     /// The built-in adapters, keeping first pages in `data_dir`. Order
     /// settles hosts more than one adapter claims.
     pub(crate) fn new(data_dir: &Path) -> Self {
-        Self::with_adapters(vec![Arc::new(GitHubCli::new().with_store(data_dir))])
+        Self::with_adapters(
+            vec![Arc::new(GitHubCli::new())],
+            Some(ChangeRequestStore::new(data_dir)),
+        )
     }
 
-    fn with_adapters(adapters: Vec<Arc<dyn ChangeRequestBoardProvider>>) -> Self {
-        Self { adapters }
+    fn with_adapters(
+        adapters: Vec<Arc<dyn ChangeRequestBoardProvider>>,
+        store: Option<ChangeRequestStore>,
+    ) -> Self {
+        Self {
+            adapters: adapters.into_iter().map(Registered::new).collect(),
+            store,
+        }
+    }
+
+    /// `adapters` in this order, storing first pages in `data_dir` if given.
+    #[cfg(test)]
+    pub(crate) fn for_tests(
+        adapters: Vec<Arc<dyn ChangeRequestBoardProvider>>,
+        data_dir: Option<&Path>,
+    ) -> Self {
+        Self::with_adapters(adapters, data_dir.map(ChangeRequestStore::new))
     }
 
     /// Put `adapter` first, replacing any adapter with its id.
     #[cfg(test)]
     pub(crate) fn with_adapter(mut self, adapter: Arc<dyn ChangeRequestBoardProvider>) -> Self {
         self.adapters
-            .retain(|existing| existing.provider_id() != adapter.provider_id());
-        self.adapters.insert(0, adapter);
+            .retain(|existing| existing.adapter.provider_id() != adapter.provider_id());
+        self.adapters.insert(0, Registered::new(adapter));
         self
     }
 
-    fn for_host(&self, host: &str) -> Option<&dyn ChangeRequestBoardProvider> {
+    /// The answers cached for the adapter `provider_id`.
+    #[cfg(test)]
+    pub(crate) fn requests(&self, provider_id: &str) -> &RequestCache {
+        &self
+            .adapters
+            .iter()
+            .find(|registered| registered.adapter.provider_id() == provider_id)
+            .expect("registered adapter")
+            .requests
+    }
+
+    fn for_host(&self, host: &str) -> Option<&Registered> {
         let host = host.to_ascii_lowercase();
         self.adapters
             .iter()
-            .find(|adapter| adapter.serves_host(&host))
-            .map(|adapter| adapter.as_ref())
+            .find(|registered| registered.adapter.serves_host(&host))
     }
 
     /// Whether any adapter answers for `host`.
@@ -122,20 +298,27 @@ impl ChangeRequestBoardProviders {
     }
 
     /// The adapter serving `scope`'s host, if it names that repository.
-    fn for_scope(
-        &self,
-        scope: &ChangeRequestScope,
-    ) -> Result<&dyn ChangeRequestBoardProvider, ChangeRequestError> {
+    fn for_scope(&self, scope: &ChangeRequestScope) -> Result<&Registered, ChangeRequestError> {
         self.for_host(scope.host())
-            .filter(|adapter| adapter.scope(scope.host(), scope.path()).is_some())
+            .filter(|registered| {
+                registered
+                    .adapter
+                    .scope(scope.host(), scope.path())
+                    .is_some()
+            })
             .ok_or(ChangeRequestError::UnsupportedRepository)
     }
 
-    fn for_url(&self, url: &str) -> Result<&dyn ChangeRequestBoardProvider, ChangeRequestError> {
+    /// The adapter that opens `url`, and the URL as it spells it.
+    fn for_url(&self, url: &str) -> Result<(&Registered, String), ChangeRequestError> {
         self.adapters
             .iter()
-            .find(|adapter| adapter.owns_url(url))
-            .map(|adapter| adapter.as_ref())
+            .find_map(|registered| {
+                registered
+                    .adapter
+                    .change_request_url(url)
+                    .map(|url| (registered, url))
+            })
             .ok_or(ChangeRequestError::UnsupportedRepository)
     }
 
@@ -143,7 +326,7 @@ impl ChangeRequestBoardProviders {
     /// a repository there.
     pub(crate) fn scope(&self, host: &str, path: &str) -> Option<ChangeRequestScope> {
         let host = host.to_ascii_lowercase();
-        self.for_host(&host)?.scope(&host, path)
+        self.for_host(&host)?.adapter.scope(&host, path)
     }
 
     /// A scope as the wire spells it, when an adapter accepts it.
@@ -152,13 +335,34 @@ impl ChangeRequestBoardProviders {
         self.scope(scope.host(), scope.path())
     }
 
+    /// The provider's current name for `scope`, following renames. `None`
+    /// when it can't be told within a few seconds (missing, private to
+    /// another account, offline). Shares the board's cache and rate-limit
+    /// pause.
     pub(crate) async fn canonical_scope(
         &self,
         scope: &ChangeRequestScope,
     ) -> Option<ChangeRequestScope> {
-        self.for_scope(scope).ok()?.canonical_scope(scope).await
+        let registered = self.for_scope(scope).ok()?;
+        let key = format!("repository:{}", scope.to_string().to_ascii_lowercase());
+        let (adapter, wanted) = (registered.adapter.clone(), scope.clone());
+        let lookup = registered.requests.request(key, false, async move {
+            Ok(match adapter.canonical_scope(&wanted).await? {
+                Some(canonical) => serde_json::Value::String(canonical.path().to_owned()),
+                None => serde_json::Value::Null,
+            })
+        });
+        let value = tokio::time::timeout(Duration::from_secs(5), lookup)
+            .await
+            .ok()?
+            .ok()?;
+        registered.adapter.scope(scope.host(), value.as_str()?)
     }
 
+    /// One page of `scope`'s open change requests. Only first pages are
+    /// stored on disk: `cached` asks for the stored copy, whatever its age,
+    /// so the board can show it at once and refresh behind it; without one
+    /// the provider is read as usual. Every first page read is stored.
     pub(crate) async fn list_page(
         &self,
         scope: &ChangeRequestScope,
@@ -167,17 +371,51 @@ impl ChangeRequestBoardProviders {
         refresh: bool,
         cached: bool,
     ) -> Result<ChangeRequestPage, ChangeRequestError> {
-        let adapter = self.for_scope(scope)?;
-        let mut page = adapter
-            .list_page(scope, filter, after, refresh, cached)
-            .await?;
-        // Rows name the adapter that listed them, whatever it wrote.
-        for item in &mut page.items {
-            item.provider = adapter.provider_id().into();
-            adapter.present(item);
+        let registered = self.for_scope(scope)?;
+        if after.is_some_and(|cursor| !valid_page_cursor(cursor)) {
+            return Err(ChangeRequestError::Decode);
         }
-        page.presentation = Some(adapter.presentation());
-        Ok(page)
+        let repository = scope.to_string();
+        let stored = match &self.store {
+            Some(store) if after.is_none() => registered
+                .adapter
+                .account_key(scope.host())
+                .await
+                .map(|account| (store, account)),
+            _ => None,
+        };
+        if cached
+            && !refresh
+            && let Some((store, account)) = &stored
+            && let Some(page) = store.load(account, &repository, filter).await
+        {
+            return Ok(present(registered, page));
+        }
+        let key = format!(
+            "list:{}:{filter:?}:{}",
+            repository.to_ascii_lowercase(),
+            after.unwrap_or_default()
+        );
+        let (adapter, wanted, after_cursor) = (
+            registered.adapter.clone(),
+            scope.clone(),
+            after.map(str::to_owned),
+        );
+        let value = registered
+            .requests
+            .request(key, refresh, async move {
+                let page = adapter
+                    .list_page(&wanted, filter, after_cursor.as_deref())
+                    .await?;
+                serde_json::to_value(page).map_err(|_| ChangeRequestError::Decode)
+            })
+            .await?;
+        let page: ChangeRequestPage =
+            serde_json::from_value(value).map_err(|_| ChangeRequestError::Decode)?;
+        if let Some((store, account)) = stored {
+            store.save(&account, &repository, filter, &page).await;
+        }
+        Ok(present(registered, page))
     }
 
     /// How clients present `scope`'s provider, for a board that has no page
@@ -188,9 +426,12 @@ impl ChangeRequestBoardProviders {
     ) -> Option<ChangeRequestPresentation> {
         self.for_scope(scope)
             .ok()
-            .map(|adapter| adapter.presentation())
+            .map(|registered| registered.adapter.presentation())
     }
 
+    /// The detail, or with `diff` the patch. A board that observed a new
+    /// revision (`head`, `base`) never joins an older read in flight or
+    /// reuses its cached answer.
     pub(crate) async fn change_request(
         &self,
         url: &str,
@@ -199,66 +440,58 @@ impl ChangeRequestBoardProviders {
         head: Option<&str>,
         base: Option<&str>,
     ) -> Result<serde_json::Value, ChangeRequestError> {
-        let adapter = self.for_url(url)?;
-        let mut value = adapter
-            .change_request(url, diff, refresh, head, base)
+        let (registered, url) = self.for_url(url)?;
+        for oid in [head, base].into_iter().flatten() {
+            if !zeron_proto::change_request_assessment::valid_head_oid(oid) {
+                return Err(ChangeRequestError::Decode);
+            }
+        }
+        let key = format!(
+            "{diff}:{url}:{}:{}",
+            head.unwrap_or_default(),
+            base.unwrap_or_default()
+        );
+        let adapter = registered.adapter.clone();
+        let (head, base) = (head.map(str::to_owned), base.map(str::to_owned));
+        let mut value = registered
+            .requests
+            .request(key, refresh, async move {
+                adapter
+                    .change_request(&url, diff, head.as_deref(), base.as_deref())
+                    .await
+            })
             .await?;
         if let Some(detail) = value.as_object_mut().filter(|_| !diff) {
-            let presentation = serde_json::to_value(adapter.presentation())
+            let presentation = serde_json::to_value(registered.adapter.presentation())
                 .map_err(|_| ChangeRequestError::Decode)?;
             detail.insert("presentation".into(), presentation);
         }
         Ok(value)
     }
 
+    /// Post once; never retried. The cached detail is dropped whatever the
+    /// outcome: a write may have landed even when its reply failed.
     pub(crate) async fn post_comment(
         &self,
         url: &str,
         body: &str,
     ) -> Result<ChangeRequestComment, ChangeRequestError> {
-        self.for_url(url)?.post_comment(url, body).await
+        let (registered, url) = self.for_url(url)?;
+        let comment = registered.adapter.post_comment(&url, body).await;
+        registered.requests.evict(&format!("false:{url}:")).await;
+        comment
     }
 }
 
-/// A list page through the on-disk store, shared so every adapter keys it the
-/// same way. Only first pages are stored. `cached` asks for the stored copy,
-/// whatever its age, so the board can show it at once and refresh behind it;
-/// without one, `fetch` runs as usual. Every first page fetched is stored.
-#[allow(clippy::too_many_arguments)] // one board query, spelled out as the RPC sends it
-pub(crate) async fn stored_page<P>(
-    provider: &P,
-    store: Option<&ChangeRequestStore>,
-    scope: &ChangeRequestScope,
-    filter: ChangeRequestFilter,
-    after: Option<&str>,
-    refresh: bool,
-    cached: bool,
-    fetch: impl Future<Output = Result<ChangeRequestPage, ChangeRequestError>>,
-) -> Result<ChangeRequestPage, ChangeRequestError>
-where
-    P: ChangeRequestBoardProvider + ?Sized,
-{
-    let repository = scope.to_string();
-    let repository = repository.as_str();
-    let stored = match store {
-        Some(store) if after.is_none() => provider
-            .account_key()
-            .await
-            .map(|account| (store.clone(), account)),
-        _ => None,
-    };
-    if cached
-        && !refresh
-        && let Some((store, account)) = &stored
-        && let Some(page) = store.load(account, repository, filter).await
-    {
-        return Ok(page);
+/// `page` as clients see it: each row stamped with the adapter that listed
+/// it, whatever it wrote, and presented by it, beside its presentation.
+fn present(registered: &Registered, mut page: ChangeRequestPage) -> ChangeRequestPage {
+    for item in &mut page.items {
+        item.provider = registered.adapter.provider_id().into();
+        registered.adapter.present(item);
     }
-    let page = fetch.await?;
-    if let Some((store, account)) = stored {
-        store.save(&account, repository, filter, &page).await;
-    }
-    Ok(page)
+    page.presentation = Some(registered.adapter.presentation());
+    page
 }
 
 #[cfg(test)]
@@ -350,12 +583,13 @@ pub(crate) mod tests {
                 .flatten()
         }
 
-        fn owns_url(&self, url: &str) -> bool {
-            url.strip_prefix("https://forge.test/")
-                .and_then(|rest| rest.split_once("/-/changes/"))
-                .is_some_and(|(path, number)| {
-                    self.scope("forge.test", path).is_some() && number.parse::<u64>().is_ok()
-                })
+        fn change_request_url(&self, url: &str) -> Option<String> {
+            let (path, number) = url
+                .strip_prefix("https://forge.test/")?
+                .split_once("/-/changes/")?;
+            self.scope("forge.test", path)?;
+            let number: u64 = number.parse().ok()?;
+            Some(format!("https://forge.test/{path}/-/changes/{number}"))
         }
 
         fn presentation(&self) -> ChangeRequestPresentation {
@@ -379,13 +613,19 @@ pub(crate) mod tests {
             item.reference = Some(format!("~{}", item.number));
         }
 
-        async fn account_key(&self) -> Option<String> {
-            Some("forge:devuser".into())
+        async fn account_key(&self, host: &str) -> Option<String> {
+            Some(format!("forge:{host}:devuser"))
         }
 
-        async fn canonical_scope(&self, scope: &ChangeRequestScope) -> Option<ChangeRequestScope> {
+        async fn canonical_scope(
+            &self,
+            scope: &ChangeRequestScope,
+        ) -> Result<Option<ChangeRequestScope>, ChangeRequestError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            Some(scope.clone())
+            let repositories = self.repositories.lock().unwrap();
+            Ok(repositories
+                .contains_key(&scope.path().to_ascii_lowercase())
+                .then(|| scope.clone()))
         }
 
         async fn list_page(
@@ -393,8 +633,6 @@ pub(crate) mod tests {
             scope: &ChangeRequestScope,
             _filter: ChangeRequestFilter,
             _after: Option<&str>,
-            _refresh: bool,
-            _cached: bool,
         ) -> Result<ChangeRequestPage, ChangeRequestError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let items = self
@@ -417,7 +655,6 @@ pub(crate) mod tests {
             &self,
             url: &str,
             diff: bool,
-            _refresh: bool,
             _head: Option<&str>,
             _base: Option<&str>,
         ) -> Result<serde_json::Value, ChangeRequestError> {
@@ -446,10 +683,10 @@ pub(crate) mod tests {
     /// GitHub, unable to start a process, then the forge.
     fn registry(forge: Forge) -> (ChangeRequestBoardProviders, Arc<Forge>) {
         let forge = Arc::new(forge);
-        let providers = ChangeRequestBoardProviders::with_adapters(vec![
-            Arc::new(GitHubCli::offline()),
-            forge.clone(),
-        ]);
+        let providers = ChangeRequestBoardProviders::for_tests(
+            vec![Arc::new(GitHubCli::offline()), forge.clone()],
+            None,
+        );
         (providers, forge)
     }
 
@@ -458,7 +695,7 @@ pub(crate) mod tests {
         providers
             .for_scope(&scope)
             .ok()
-            .map(|adapter| adapter.provider_id())
+            .map(|registered| registered.adapter.provider_id())
     }
 
     #[test]
@@ -501,15 +738,15 @@ pub(crate) mod tests {
     #[test]
     fn hosts_more_than_one_adapter_claims_go_to_the_first_registered() {
         let claiming = || Arc::new(Forge::serving(&["forge.test", "github.com"]));
-        let github_first = ChangeRequestBoardProviders::with_adapters(vec![
-            Arc::new(GitHubCli::offline()),
-            claiming(),
-        ]);
+        let github_first = ChangeRequestBoardProviders::for_tests(
+            vec![Arc::new(GitHubCli::offline()), claiming()],
+            None,
+        );
         assert_eq!(adapter_for(&github_first, "acme/zeron"), Some("github"));
-        let forge_first = ChangeRequestBoardProviders::with_adapters(vec![
-            claiming(),
-            Arc::new(GitHubCli::offline()),
-        ]);
+        let forge_first = ChangeRequestBoardProviders::for_tests(
+            vec![claiming(), Arc::new(GitHubCli::offline())],
+            None,
+        );
         assert_eq!(adapter_for(&forge_first, "acme/zeron"), Some("forge"));
         assert_eq!(
             adapter_for(&forge_first, "forge.test/team/app"),
@@ -596,6 +833,109 @@ pub(crate) mod tests {
         assert_eq!(
             providers.change_request(url, true, false, None, None).await,
             Ok(serde_json::Value::String(String::new()))
+        );
+    }
+
+    #[tokio::test]
+    async fn the_registry_stores_and_caches_pages_for_every_adapter_alike() {
+        use ChangeRequestFilter::All;
+        let dir = tempfile::tempdir().unwrap();
+        let forge = Arc::new(Forge::new().with_repository("team/platform/app", &[7]));
+        let providers = ChangeRequestBoardProviders::for_tests(
+            vec![Arc::new(GitHubCli::offline()), forge.clone()],
+            Some(dir.path()),
+        );
+        let scope = providers.parse("forge.test/team/platform/app").unwrap();
+        // Nothing stored yet: a cached read reaches the adapter and stores.
+        let first = providers
+            .list_page(&scope, All, None, false, true)
+            .await
+            .unwrap();
+        assert_eq!(first.items[0].number, 7);
+        // Identical reads share the answer; the adapter is asked once.
+        providers
+            .list_page(&scope, All, None, false, false)
+            .await
+            .unwrap();
+        assert_eq!(forge.calls(), 1);
+        // Stored under the adapter's own account key and the wire scope.
+        let store = ChangeRequestStore::new(dir.path());
+        let repository = "forge.test/team/platform/app";
+        assert!(
+            store
+                .load("forge:forge.test:devuser", repository, All)
+                .await
+                .is_some()
+        );
+        assert!(store.load("devuser", repository, All).await.is_none());
+
+        // A relaunch serves the stored page, presented, without the adapter
+        // (which has since lost the repository).
+        let relaunched_forge = Arc::new(Forge::new());
+        let relaunched = ChangeRequestBoardProviders::for_tests(
+            vec![relaunched_forge.clone()],
+            Some(dir.path()),
+        );
+        let stored = relaunched
+            .list_page(&scope, All, None, false, true)
+            .await
+            .unwrap();
+        assert_eq!(stored.items[0].reference.as_deref(), Some("~7"));
+        assert_eq!(stored.presentation.unwrap().provider_name, "Forge");
+        assert_eq!(
+            stored.fetched_at.map(|at| at.timestamp_millis()),
+            first.fetched_at.map(|at| at.timestamp_millis())
+        );
+        assert_eq!(relaunched_forge.calls(), 0);
+        // Refresh always reaches the adapter.
+        assert_eq!(
+            relaunched
+                .list_page(&scope, All, None, true, false)
+                .await
+                .err(),
+            Some(ChangeRequestError::CommandFailed)
+        );
+        assert_eq!(relaunched_forge.calls(), 1);
+        // Cursors are checked before any adapter sees them.
+        assert_eq!(
+            providers
+                .list_page(&scope, All, Some("x repo:other/x"), false, false)
+                .await
+                .err(),
+            Some(ChangeRequestError::Decode)
+        );
+
+        // Canonical names share the cache too.
+        for _ in 0..2 {
+            assert_eq!(providers.canonical_scope(&scope).await, Some(scope.clone()));
+        }
+        assert_eq!(forge.calls(), 2);
+        let missing = providers.parse("forge.test/team/missing").unwrap();
+        assert_eq!(providers.canonical_scope(&missing).await, None);
+
+        // Details are cached per canonical URL; a comment drops the detail.
+        let url = "https://forge.test/team/platform/app/-/changes/07";
+        for _ in 0..2 {
+            providers
+                .change_request(url, false, false, None, None)
+                .await
+                .unwrap();
+        }
+        assert_eq!(forge.calls(), 4);
+        providers.post_comment(url, "hello").await.unwrap();
+        providers
+            .change_request(url, false, false, None, None)
+            .await
+            .unwrap();
+        assert_eq!(forge.calls(), 6);
+        assert!(
+            providers
+                .requests("forge")
+                .state()
+                .await
+                .entries
+                .iter()
+                .any(|entry| entry.0 == "false:https://forge.test/team/platform/app/-/changes/7::")
         );
     }
 }
