@@ -5,6 +5,8 @@
 
 #[path = "source_control_review_threads.rs"]
 mod review_threads;
+#[path = "source_control_gitlab.rs"]
+pub(crate) mod gitlab;
 
 use std::io;
 use std::path::{Path, PathBuf};
