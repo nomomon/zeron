@@ -1148,6 +1148,28 @@ impl WorkspaceHost {
         Ok(self.mutate(|doc| doc.rename_device(device_id, name))?)
     }
 
+    /// Tombstone another device's row. Refused for this device (its row is
+    /// rewritten on every boot anyway) and while the device still hosts
+    /// projects or unarchived sessions: forgetting never deletes them.
+    pub fn forget_device(&self, device_id: &str) -> Result<bool, EngineError> {
+        if device_id == self.inner.config.device_id {
+            return Err(EngineError::Other("cannot forget this device".into()));
+        }
+        let (projects, sessions) = self.read(|doc| -> Result<_, zeron_doc::DocError> {
+            Ok(zeron_proto::device_holdings(
+                device_id,
+                &doc.read_spaces()?,
+                &doc.read_chats()?,
+            ))
+        })?;
+        if projects > 0 || sessions > 0 {
+            return Err(EngineError::Other(format!(
+                "device still hosts {projects} project(s) and {sessions} session(s); remove them first"
+            )));
+        }
+        Ok(self.mutate(|doc| doc.delete_device(device_id))?)
+    }
+
     // ── git metadata (diff-sync host writes) ────────────────────────────────
 
     /// HEAD-watcher reconciliation: the branch checked out at the chat's cwd.

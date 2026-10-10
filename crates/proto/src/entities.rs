@@ -102,6 +102,19 @@ impl Device {
     }
 }
 
+/// What a device still hosts: `(projects, sessions)`, counting unarchived
+/// top-level sessions only (side chats never show in the sidebar, so the
+/// user could not remove them). A device is forgettable only at `(0, 0)`.
+/// Lives here (proto) so the forget dialog and the engine's check agree.
+pub fn device_holdings(device_id: &str, spaces: &[Space], chats: &[Chat]) -> (usize, usize) {
+    let projects = spaces.iter().filter(|s| s.device_id == device_id).count();
+    let sessions = chats
+        .iter()
+        .filter(|c| c.device_id == device_id && !c.archived && c.is_top_level())
+        .count();
+    (projects, sessions)
+}
+
 /// A synced (device, folder) pair — the unit of organization in the sidebar.
 /// Sessions belong to exactly one space; the space fixes their host device and
 /// base cwd. Folders need not be git repos: `git_detected` is stamped by the

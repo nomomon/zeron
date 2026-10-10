@@ -1093,6 +1093,18 @@ impl RegistryDoc {
         Ok(true)
     }
 
+    /// Forget a device: tombstone its row (settings UI; any device may write).
+    /// Nothing cascades, so callers refuse devices that still host rows. The
+    /// device's next boot upsert is newer than the tombstone and revives the
+    /// row. `false` when no such row.
+    pub fn delete_device(&mut self, device_id: &str) -> Result<bool, DocError> {
+        if !self.row_exists(KIND_DEVICES, device_id) {
+            return Ok(false);
+        }
+        self.delete_row_ops(&[(KIND_DEVICES, device_id)]);
+        Ok(true)
+    }
+
     pub fn read_devices(&self) -> Result<Vec<Device>, DocError> {
         let mut devices: Vec<Device> = self
             .read_kind::<crate::workspace::RawDevice>(KIND_DEVICES)

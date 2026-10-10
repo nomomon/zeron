@@ -737,6 +737,49 @@ fn delete_space_cascades_and_converges() {
     assert!(again.chat_ids.is_empty());
 }
 
+/// Forgetting a device must not be final: its next boot upsert brings the
+/// row back on every replica.
+#[test]
+fn delete_device_tombstones_and_a_later_boot_upsert_revives_it() {
+    let mut a = RegistryDoc::new("dev-a");
+    let mut old = RegistryDoc::new("old-laptop");
+    a.upsert_device(&device("dev-a", "desk")).unwrap();
+    old.upsert_device(&device("old-laptop", "old-laptop"))
+        .unwrap();
+    let mut server = HashMap::new();
+    let mut seq = 0u64;
+    server_round(&mut server, &mut seq, &mut [&mut a, &mut old]);
+    // Keep the HLCs out of the same-millisecond device-id tiebreak.
+    std::thread::sleep(std::time::Duration::from_millis(2));
+
+    assert!(a.delete_device("old-laptop").unwrap());
+    let ids = |doc: &RegistryDoc| {
+        doc.read_devices()
+            .unwrap()
+            .into_iter()
+            .map(|d| d.id)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ids(&a), vec!["dev-a"]);
+    server_round(&mut server, &mut seq, &mut [&mut a, &mut old]);
+    assert_eq!(ids(&old), vec!["dev-a"]);
+    // A missing row is a no-op: no tombstone is queued.
+    let before = a.pending_len();
+    assert!(!a.delete_device("old-laptop").unwrap());
+    assert!(!a.delete_device("never-seen").unwrap());
+    assert_eq!(a.pending_len(), before);
+    // Field updates never revive it; only the boot upsert does.
+    assert!(!old.set_device_last_seen("old-laptop", ts(9_000)).unwrap());
+
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    old.upsert_device(&device("old-laptop", "old-laptop"))
+        .unwrap();
+    server_round(&mut server, &mut seq, &mut [&mut a, &mut old]);
+    for doc in [&a, &old] {
+        assert_eq!(ids(doc), vec!["dev-a", "old-laptop"]);
+    }
+}
+
 #[test]
 fn persistence_round_trips_rows_pending_and_cursor() {
     let mut doc = RegistryDoc::new("dev-a");

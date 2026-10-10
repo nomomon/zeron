@@ -11,7 +11,7 @@
 //! - `WatchSessions` → stream of `Session[]`: this engine's live statuses merged with
 //!   remote devices' workspace session rows
 //! - `Mutate {op, …}` → `{ok}` — workspace entity mutations (createChat, renameChat,
-//!   setChatArchived, deleteChat, renameDevice, markChatSeen)
+//!   setChatArchived, deleteChat, renameDevice, forgetDevice, markChatSeen)
 //! - `EngineInfo` → `{deviceId, workspaceScope}` — this runtime's fixed identity
 //!   and data boundary (never forwarded)
 //! - `LocalDevice` → `{deviceId}` — legacy engine identity (never forwarded)
@@ -602,6 +602,10 @@ enum MutateParams {
     DeleteChat { chat_id: String },
     #[serde(rename_all = "camelCase")]
     RenameDevice { device_id: String, name: String },
+    /// Tombstone another device's row (`forget-device-v1`). Refused for this
+    /// device and for one that still hosts projects or sessions.
+    #[serde(rename_all = "camelCase")]
+    ForgetDevice { device_id: String },
     /// Synced seen marker (LWW + monotonic guard): clears the "completed"
     /// badge on every device. `at` is epoch ms; default = now.
     #[serde(rename_all = "camelCase")]
@@ -1265,6 +1269,11 @@ impl EngineRpc {
             MutateParams::RenameDevice { device_id, name } => self
                 .workspace
                 .rename_device(&device_id, &name)
+                .map_err(failed)
+                .map(drop),
+            MutateParams::ForgetDevice { device_id } => self
+                .workspace
+                .forget_device(&device_id)
                 .map_err(failed)
                 .map(drop),
             MutateParams::MarkChatSeen { chat_id, at } => {
@@ -3694,6 +3703,75 @@ mod tests {
             let row = core.workspace.chat(chat).unwrap().unwrap();
             assert_eq!(row.parent_chat_id.as_deref(), expected);
         }
+        core.sessions.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn forget_device_refuses_self_and_hosts_and_tombstones_orphans() {
+        let temp = tempfile::tempdir().unwrap();
+        let core = crate::EngineCore::assemble_with_profile(
+            crate::EngineProfile::local(temp.path()).unwrap(),
+            std::sync::Arc::new(HarnessRegistry::new()),
+            HarnessId::Codex,
+            None,
+        )
+        .unwrap();
+        let rpc = core.rpc_service();
+        core.workspace.upsert_device_row(&zeron_proto::Device {
+            id: "old-laptop".into(),
+            name: "old-laptop".into(),
+            platform: "linux".into(),
+            last_seen_at: None,
+            created_at: None,
+            version: None,
+            cursor_sdk_version: None,
+            capabilities: Vec::new(),
+        });
+        let mutate = |params: serde_json::Value| rpc.handle(methods::MUTATE, params);
+        let forget =
+            |device: &str| mutate(serde_json::json!({"op":"forgetDevice", "deviceId":device}));
+        let refusal = |result: Result<RpcReply, RpcError>| match result {
+            Err(RpcError::Failed(message)) => message,
+            Err(other) => panic!("unexpected error: {other}"),
+            Ok(_) => panic!("forgetDevice unexpectedly succeeded"),
+        };
+        let listed = |id: &str| {
+            core.workspace
+                .read_devices()
+                .unwrap()
+                .iter()
+                .any(|device| device.id == id)
+        };
+
+        assert!(refusal(forget(&core.device_id).await).contains("this device"));
+        assert!(listed(&core.device_id));
+
+        mutate(serde_json::json!({"op":"createSpace", "spaceId":"sp-old",
+            "deviceId":"old-laptop", "path":"/tmp/old"}))
+        .await
+        .unwrap();
+        assert!(refusal(forget("old-laptop").await).contains("1 project(s)"));
+        mutate(serde_json::json!({"op":"deleteSpace", "spaceId":"sp-old"}))
+            .await
+            .unwrap();
+
+        mutate(serde_json::json!({"op":"createChat", "chatId":"chat-old",
+            "deviceId":"old-laptop",
+            "config":{"harness":"codex","sandbox":"workspace-write"}}))
+        .await
+        .unwrap();
+        assert!(refusal(forget("old-laptop").await).contains("1 session(s)"));
+        assert!(listed("old-laptop"));
+
+        // Archived sessions don't pin the device, and survive the forget.
+        mutate(serde_json::json!({"op":"setChatArchived", "chatId":"chat-old", "archived":true}))
+            .await
+            .unwrap();
+        forget("old-laptop").await.unwrap();
+        assert!(!listed("old-laptop"));
+        assert!(core.workspace.chat("chat-old").unwrap().is_some());
+        // An unknown device is a no-op.
+        forget("old-laptop").await.unwrap();
         core.sessions.shutdown().await;
     }
 
