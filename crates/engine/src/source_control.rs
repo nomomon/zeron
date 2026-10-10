@@ -19,13 +19,13 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 use zeron_proto::{
     ChangeRequestListItem, ChangeRequestMergeability, ChangeRequestReviewDecision,
-    ChangeRequestState, ChangeRequestSummary,
+    ChangeRequestScope, ChangeRequestState, ChangeRequestSummary,
 };
 
-use crate::change_request_board::{
-    ChangeRequestBoardProvider, ChangeRequestBoardProviders, ChangeRequestScope, GITHUB_HOST,
-    GITHUB_PROVIDER,
-};
+use crate::change_request_board::{ChangeRequestBoardProvider, ChangeRequestBoardProviders};
+
+const GITHUB_PROVIDER: &str = "github";
+const GITHUB_HOST: &str = "github.com";
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(10);
 const GITHUB_TIMEOUT: Duration = Duration::from_secs(20);
@@ -243,8 +243,7 @@ impl ChangeRequestResolver {
                         return Some(scope);
                     }
                     // Another host's repository can't be renamed into this one.
-                    if scope.provider == wanted.provider
-                        && scope.host == wanted.host
+                    if scope.host() == wanted.host()
                         && !scopes
                             .iter()
                             .any(|seen: &ChangeRequestScope| seen.same_repository(&scope))
@@ -264,28 +263,21 @@ impl ChangeRequestResolver {
         None
     }
 
-    /// The board scope for a remote whose host has an adapter.
+    /// The board scope for a remote: its host and whole path, read once,
+    /// then accepted (or not) by the adapter serving that host.
     async fn remote_scope(
         &self,
         remote_url: &str,
         providers: &ChangeRequestBoardProviders,
     ) -> Option<ChangeRequestScope> {
         let (host, path) = self
-            .remote_repository(remote_url, |host| providers.for_host(host).is_some())
+            .remote_repository(remote_url, |host| providers.serves_host(host))
             .await?;
         providers.scope(&host, &path)
     }
 
-    /// `owner/name` for a remote on github.com.
-    #[cfg(test)]
-    async fn github_slug(&self, remote_url: &str) -> Option<String> {
-        self.remote_repository(remote_url, |host| host.eq_ignore_ascii_case(GITHUB_HOST))
-            .await
-            .map(|(_, path)| path)
-    }
-
-    /// The host and `owner/name` of a remote on a host `served` accepts. An
-    /// SSH remote may name a host alias from `~/.ssh/config`
+    /// The host and whole repository path of a remote on a host `served`
+    /// accepts. An SSH remote may name a host alias from `~/.ssh/config`
     /// (`git@github-work:acme/zeron.git`); `ssh -G` resolves it locally
     /// without connecting.
     async fn remote_repository(
@@ -293,12 +285,11 @@ impl ChangeRequestResolver {
         remote_url: &str,
         served: impl Fn(&str) -> bool,
     ) -> Option<(String, String)> {
-        let remote = parse_git_remote(remote_url)?;
-        let slug = format!("{}/{}", remote.owner, remote.repository);
-        if served(&remote.host) {
-            return Some((remote.host, slug));
+        let (host, path) = parse_git_remote_path(remote_url)?;
+        if served(&host) {
+            return Some((host, path));
         }
-        if !is_ssh_remote(remote_url) || !valid_ssh_alias(&remote.host) {
+        if !is_ssh_remote(remote_url) || !valid_ssh_alias(&host) {
             return None;
         }
         let output = self
@@ -306,7 +297,7 @@ impl ChangeRequestResolver {
             .runner
             .run(ProcessRequest {
                 program: "ssh".into(),
-                args: vec!["-G".into(), remote.host.clone()],
+                args: vec!["-G".into(), host],
                 stdin: None,
                 cwd: None,
                 env: Vec::new(),
@@ -320,7 +311,7 @@ impl ChangeRequestResolver {
         }
         ssh_config_hostname(&String::from_utf8_lossy(&output.stdout))
             .filter(|host| served(host))
-            .map(|host| (host.to_ascii_lowercase(), slug))
+            .map(|host| (host.to_ascii_lowercase(), path))
     }
 
     pub async fn resolve_github(
@@ -809,6 +800,20 @@ impl GitHubCli {
         }
     }
 
+    /// An adapter whose every `gh` call fails to start, for registry tests
+    /// that must never reach a real CLI.
+    #[cfg(test)]
+    pub(crate) fn offline() -> Self {
+        struct NoProcesses;
+        #[async_trait]
+        impl ProcessRunner for NoProcesses {
+            async fn run(&self, _: ProcessRequest) -> Result<ProcessOutput, ProcessRunError> {
+                Err(ProcessRunError::Spawn(io::ErrorKind::NotFound))
+            }
+        }
+        Self::with_runner(Arc::new(NoProcesses))
+    }
+
     /// Keep the board's first pages in `data_dir`, so it opens at once.
     pub(crate) fn with_store(mut self, data_dir: &Path) -> Self {
         self.store = Some(crate::change_request_store::ChangeRequestStore::new(
@@ -876,16 +881,16 @@ impl GitHubCli {
         refresh: bool,
         cached: bool,
     ) -> Result<zeron_proto::ChangeRequestPage, ChangeRequestError> {
-        if !valid_pr_repository(repository) {
+        let Some(scope) = ChangeRequestBoardProvider::scope(self, GITHUB_HOST, repository) else {
             return Err(ChangeRequestError::UnsupportedRepository);
-        }
+        };
         if after.is_some_and(|cursor| !valid_page_cursor(cursor)) {
             return Err(ChangeRequestError::Decode);
         }
         crate::change_request_board::stored_page(
             self,
             self.store.as_ref(),
-            repository,
+            &scope,
             filter,
             after,
             refresh,
@@ -1193,6 +1198,13 @@ impl ChangeRequestBoardProvider for GitHubCli {
         host.eq_ignore_ascii_case(GITHUB_HOST)
     }
 
+    /// `owner/repo`, never nested.
+    fn scope(&self, host: &str, path: &str) -> Option<ChangeRequestScope> {
+        valid_pr_repository(path)
+            .then(|| ChangeRequestScope::new(host, path))
+            .flatten()
+    }
+
     fn owns_url(&self, url: &str) -> bool {
         validated_pull_request_url(url).is_ok()
     }
@@ -1203,11 +1215,8 @@ impl ChangeRequestBoardProvider for GitHubCli {
     }
 
     async fn canonical_scope(&self, scope: &ChangeRequestScope) -> Option<ChangeRequestScope> {
-        let path = self.canonical_repository(&scope.path).await?;
-        Some(ChangeRequestScope {
-            path,
-            ..scope.clone()
-        })
+        let path = self.canonical_repository(scope.path()).await?;
+        ChangeRequestScope::new(scope.host(), &path)
     }
 
     async fn list_page(
@@ -1218,7 +1227,7 @@ impl ChangeRequestBoardProvider for GitHubCli {
         refresh: bool,
         cached: bool,
     ) -> Result<zeron_proto::ChangeRequestPage, ChangeRequestError> {
-        GitHubCli::list_page(self, &scope.path, filter, after, refresh, cached).await
+        GitHubCli::list_page(self, scope.path(), filter, after, refresh, cached).await
     }
 
     async fn change_request(
@@ -1296,6 +1305,22 @@ impl BranchHeadContext {
 /// The host is intentionally not restricted to `github.com`: GitHub Enterprise
 /// installations use arbitrary hostnames and are resolved later by the provider.
 pub fn parse_git_remote(remote_url: &str) -> Option<GitRemote> {
+    let (host, path) = parse_git_remote_path(remote_url)?;
+    let (owner, repository) = path.split_once('/')?;
+    if repository.contains('/') {
+        return None;
+    }
+    Some(GitRemote {
+        host,
+        owner: owner.to_owned(),
+        repository: repository.to_owned(),
+    })
+}
+
+/// The lowercase host and whole repository path of a remote in the forms
+/// [`parse_git_remote`] accepts, nested groups included
+/// (`git@forge.example:group/subgroup/project.git`). Users and ports go.
+fn parse_git_remote_path(remote_url: &str) -> Option<(String, String)> {
     let remote_url = remote_url.trim();
     if remote_url.is_empty() || remote_url.chars().any(char::is_whitespace) {
         return None;
@@ -1319,22 +1344,13 @@ pub fn parse_git_remote(remote_url: &str) -> Option<GitRemote> {
     };
 
     let path = path.trim_matches('/');
-    let mut segments = path.split('/');
-    let owner = segments.next()?;
-    let repository = segments.next()?;
-    if segments.next().is_some() || owner.is_empty() || repository.is_empty() {
-        return None;
-    }
-    let repository = repository.strip_suffix(".git").unwrap_or(repository);
-    if repository.is_empty() {
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let segments: Vec<_> = path.split('/').collect();
+    if segments.len() < 2 || segments.iter().any(|segment| segment.is_empty()) {
         return None;
     }
 
-    Some(GitRemote {
-        host: host.to_ascii_lowercase(),
-        owner: owner.to_owned(),
-        repository: repository.to_owned(),
-    })
+    Some((host.to_ascii_lowercase(), path.to_owned()))
 }
 
 /// The scp-like (`git@host:owner/repo`) and `ssh://` forms, whose host may
@@ -2751,11 +2767,20 @@ mod tests {
             inspector: GitCheckoutInspector::new(runner.clone()),
             github: GitHubCli::with_runner(runner.clone()),
         };
+        let dir = tempfile::tempdir().unwrap();
+        let providers = ChangeRequestBoardProviders::new(dir.path())
+            .with_adapter(Arc::new(GitHubCli::with_runner(runner.clone())));
+        let slug = |remote: &'static str| {
+            let (resolver, providers) = (&resolver, &providers);
+            async move {
+                resolver
+                    .remote_scope(remote, providers)
+                    .await
+                    .map(|scope| scope.to_string())
+            }
+        };
         assert_eq!(
-            resolver
-                .github_slug("git@github-work:acme/zeron.git")
-                .await
-                .as_deref(),
+            slug("git@github-work:acme/zeron.git").await.as_deref(),
             Some("acme/zeron")
         );
         let request = &runner.requests()[0];
@@ -2763,13 +2788,10 @@ mod tests {
         assert_eq!(request.args, ["-G", "github-work"]);
         // Literal github.com and HTTPS hosts never consult ssh.
         assert_eq!(
-            resolver
-                .github_slug("https://github.com/acme/zeron")
-                .await
-                .as_deref(),
+            slug("https://github.com/acme/zeron").await.as_deref(),
             Some("acme/zeron")
         );
-        assert_eq!(resolver.github_slug("https://gitlab.com/acme/zeron").await, None);
+        assert_eq!(slug("https://gitlab.com/acme/zeron").await, None);
         assert_eq!(runner.requests().len(), 1);
     }
 
@@ -2785,8 +2807,8 @@ mod tests {
         };
         let dir = tempfile::tempdir().unwrap();
         let providers = ChangeRequestBoardProviders::new(dir.path())
-            .with_github(GitHubCli::with_runner(runner.clone()));
-        let github = ChangeRequestScope::from_wire("acme/zeron");
+            .with_adapter(Arc::new(GitHubCli::with_runner(runner.clone())));
+        let github = ChangeRequestScope::parse("acme/zeron");
         for remote in [
             "https://github.com/acme/zeron.git",
             "git@GitHub.com:acme/zeron.git",

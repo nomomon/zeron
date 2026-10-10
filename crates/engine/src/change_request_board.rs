@@ -1,67 +1,37 @@
 //! Provider routing for the pull request board.
 //!
-//! The board speaks in scopes (which repository, on which host) and change
-//! request URLs; an adapter per provider turns those into CLI calls. Routing
-//! lives here so RPC handlers never name a provider, and an adapter for
-//! another host slots in beside GitHub without touching them.
+//! The board speaks in scopes (a repository on a host) and change request
+//! URLs; an adapter per provider turns those into CLI calls. Routing lives
+//! here so RPC handlers never name a provider: the registry reads a wire
+//! scope, finds the adapter serving its host, and that adapter alone decides
+//! whether the path names one of its repositories.
 
 use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use zeron_proto::{ChangeRequestComment, ChangeRequestFilter, ChangeRequestPage};
+use zeron_proto::{
+    ChangeRequestComment, ChangeRequestFilter, ChangeRequestPage, ChangeRequestScope,
+};
 
 use crate::change_request_store::ChangeRequestStore;
-use crate::source_control::{ChangeRequestError, GitHubCli, valid_pr_repository};
-
-pub(crate) const GITHUB_PROVIDER: &str = "github";
-pub(crate) const GITHUB_HOST: &str = "github.com";
-
-/// One repository on one provider host. `path` is the repository's full path
-/// as the host names it: `owner/repo` on GitHub, while GitLab nests groups
-/// (`group/subgroup/project`), so it is never split into owner and name here.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ChangeRequestScope {
-    pub provider: &'static str,
-    /// Lowercase.
-    pub host: String,
-    pub path: String,
-}
-
-impl ChangeRequestScope {
-    /// The board's wire form predates other hosts: a bare `owner/repo` always
-    /// means github.com, and nothing else is accepted.
-    pub(crate) fn from_wire(repository: &str) -> Option<Self> {
-        valid_pr_repository(repository).then(|| Self {
-            provider: GITHUB_PROVIDER,
-            host: GITHUB_HOST.into(),
-            path: repository.into(),
-        })
-    }
-
-    pub(crate) fn to_wire(&self) -> String {
-        self.path.clone()
-    }
-
-    /// Hosts and repository paths compare without case, as GitHub and GitLab
-    /// both resolve them.
-    pub(crate) fn same_repository(&self, other: &Self) -> bool {
-        self.provider == other.provider
-            && self.host.eq_ignore_ascii_case(&other.host)
-            && self.path.eq_ignore_ascii_case(&other.path)
-    }
-}
+use crate::source_control::{ChangeRequestError, GitHubCli};
 
 /// What the board needs from one provider. Every method validates its own
 /// inputs before they reach a CLI, whatever the caller already checked.
 #[async_trait]
 pub(crate) trait ChangeRequestBoardProvider: Send + Sync {
-    /// Stamped on scopes and list items.
+    /// Stamped on list items and change requests.
     fn provider_id(&self) -> &'static str;
 
-    /// Whether this adapter answers for repositories on `host`.
+    /// Whether this adapter answers for repositories on `host` (lowercase).
+    /// When several do, the one registered first wins.
     fn serves_host(&self, host: &str) -> bool;
+
+    /// `path` on `host` as a scope, when it names one of this provider's
+    /// repositories. Only asked for hosts the adapter serves.
+    fn scope(&self, host: &str, path: &str) -> Option<ChangeRequestScope>;
 
     /// Whether `url` names a change request this adapter can open.
     fn owns_url(&self, url: &str) -> bool;
@@ -109,7 +79,8 @@ pub(crate) struct ChangeRequestBoardProviders {
 }
 
 impl ChangeRequestBoardProviders {
-    /// The built-in adapters, keeping first pages in `data_dir`.
+    /// The built-in adapters, keeping first pages in `data_dir`. Order
+    /// settles hosts more than one adapter claims.
     pub(crate) fn new(data_dir: &Path) -> Self {
         Self::with_adapters(vec![Arc::new(GitHubCli::new().with_store(data_dir))])
     }
@@ -118,28 +89,35 @@ impl ChangeRequestBoardProviders {
         Self { adapters }
     }
 
-    /// Replace the GitHub adapter.
+    /// Put `adapter` first, replacing any adapter with its id.
     #[cfg(test)]
-    pub(crate) fn with_github(mut self, github: GitHubCli) -> Self {
+    pub(crate) fn with_adapter(mut self, adapter: Arc<dyn ChangeRequestBoardProvider>) -> Self {
         self.adapters
-            .retain(|adapter| adapter.provider_id() != GITHUB_PROVIDER);
-        self.adapters.insert(0, Arc::new(github));
+            .retain(|existing| existing.provider_id() != adapter.provider_id());
+        self.adapters.insert(0, adapter);
         self
     }
 
-    pub(crate) fn for_host(&self, host: &str) -> Option<&dyn ChangeRequestBoardProvider> {
+    fn for_host(&self, host: &str) -> Option<&dyn ChangeRequestBoardProvider> {
+        let host = host.to_ascii_lowercase();
         self.adapters
             .iter()
-            .find(|adapter| adapter.serves_host(host))
+            .find(|adapter| adapter.serves_host(&host))
             .map(|adapter| adapter.as_ref())
     }
 
+    /// Whether any adapter answers for `host`.
+    pub(crate) fn serves_host(&self, host: &str) -> bool {
+        self.for_host(host).is_some()
+    }
+
+    /// The adapter serving `scope`'s host, if it names that repository.
     fn for_scope(
         &self,
         scope: &ChangeRequestScope,
     ) -> Result<&dyn ChangeRequestBoardProvider, ChangeRequestError> {
-        self.for_host(&scope.host)
-            .filter(|adapter| adapter.provider_id() == scope.provider)
+        self.for_host(scope.host())
+            .filter(|adapter| adapter.scope(scope.host(), scope.path()).is_some())
             .ok_or(ChangeRequestError::UnsupportedRepository)
     }
 
@@ -151,13 +129,17 @@ impl ChangeRequestBoardProviders {
             .ok_or(ChangeRequestError::UnsupportedRepository)
     }
 
-    /// `path` on `host` as a scope, when an adapter serves that host.
+    /// `path` on `host` as a scope, when the adapter serving that host names
+    /// a repository there.
     pub(crate) fn scope(&self, host: &str, path: &str) -> Option<ChangeRequestScope> {
-        self.for_host(host).map(|adapter| ChangeRequestScope {
-            provider: adapter.provider_id(),
-            host: host.to_ascii_lowercase(),
-            path: path.into(),
-        })
+        let host = host.to_ascii_lowercase();
+        self.for_host(&host)?.scope(&host, path)
+    }
+
+    /// A scope as the wire spells it, when an adapter accepts it.
+    pub(crate) fn parse(&self, wire: &str) -> Option<ChangeRequestScope> {
+        let scope = ChangeRequestScope::parse(wire)?;
+        self.scope(scope.host(), scope.path())
     }
 
     pub(crate) async fn canonical_scope(
@@ -175,9 +157,15 @@ impl ChangeRequestBoardProviders {
         refresh: bool,
         cached: bool,
     ) -> Result<ChangeRequestPage, ChangeRequestError> {
-        self.for_scope(scope)?
+        let adapter = self.for_scope(scope)?;
+        let mut page = adapter
             .list_page(scope, filter, after, refresh, cached)
-            .await
+            .await?;
+        // Rows name the adapter that listed them, whatever it wrote.
+        for item in &mut page.items {
+            item.provider = adapter.provider_id().into();
+        }
+        Ok(page)
     }
 
     pub(crate) async fn change_request(
@@ -210,7 +198,7 @@ impl ChangeRequestBoardProviders {
 pub(crate) async fn stored_page<P>(
     provider: &P,
     store: Option<&ChangeRequestStore>,
-    repository: &str,
+    scope: &ChangeRequestScope,
     filter: ChangeRequestFilter,
     after: Option<&str>,
     refresh: bool,
@@ -220,6 +208,8 @@ pub(crate) async fn stored_page<P>(
 where
     P: ChangeRequestBoardProvider + ?Sized,
 {
+    let repository = scope.to_string();
+    let repository = repository.as_str();
     let stored = match store {
         Some(store) if after.is_none() => provider
             .account_key()
@@ -242,145 +232,280 @@ where
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use chrono::DateTime;
+    use zeron_proto::{ChangeRequestListItem, ChangeRequestMergeability, ChangeRequestState};
+
     use super::*;
 
-    fn github_only() -> ChangeRequestBoardProviders {
-        ChangeRequestBoardProviders::with_adapters(vec![Arc::new(GitHubCli::new())])
+    /// A second provider, registered only in tests and answering from
+    /// memory: projects nest under groups on `forge.test`, and its change
+    /// requests read `~7`. Nothing it does reaches a process.
+    pub(crate) struct Forge {
+        hosts: Vec<String>,
+        repositories: Mutex<HashMap<String, Vec<ChangeRequestListItem>>>,
+        pub(crate) calls: AtomicUsize,
+    }
+
+    impl Forge {
+        pub(crate) fn new() -> Self {
+            Self::serving(&["forge.test"])
+        }
+
+        pub(crate) fn serving(hosts: &[&str]) -> Self {
+            Self {
+                hosts: hosts.iter().map(|host| (*host).to_owned()).collect(),
+                repositories: Default::default(),
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        /// Open change requests `numbers` in `path`, newest first.
+        pub(crate) fn with_repository(self, path: &str, numbers: &[u64]) -> Self {
+            let items = numbers.iter().map(|number| item(path, *number)).collect();
+            self.repositories
+                .lock()
+                .unwrap()
+                .insert(path.to_ascii_lowercase(), items);
+            self
+        }
+
+        pub(crate) fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    pub(crate) fn item(path: &str, number: u64) -> ChangeRequestListItem {
+        ChangeRequestListItem {
+            provider: "forge".into(),
+            author: Default::default(),
+            repository: format!("forge.test/{path}"),
+            head_ref_oid: String::new(),
+            ci: Default::default(),
+            viewer_did_author: None,
+            viewer_review_requested: None,
+            number,
+            title: format!("Change {number}"),
+            url: format!("https://forge.test/{path}/-/changes/{number}"),
+            state: ChangeRequestState::Open,
+            is_draft: false,
+            review_decision: Default::default(),
+            additions: 1,
+            deletions: 1,
+            mergeability: ChangeRequestMergeability::Unknown,
+            created_at: DateTime::UNIX_EPOCH,
+            updated_at: DateTime::UNIX_EPOCH,
+        }
+    }
+
+    #[async_trait]
+    impl ChangeRequestBoardProvider for Forge {
+        fn provider_id(&self) -> &'static str {
+            "forge"
+        }
+
+        fn serves_host(&self, host: &str) -> bool {
+            self.hosts.iter().any(|served| served == host)
+        }
+
+        /// Groups nest at most four deep here, tighter than the wire allows.
+        fn scope(&self, host: &str, path: &str) -> Option<ChangeRequestScope> {
+            (path.split('/').count() <= 5)
+                .then(|| ChangeRequestScope::new(host, path))
+                .flatten()
+        }
+
+        fn owns_url(&self, url: &str) -> bool {
+            url.strip_prefix("https://forge.test/")
+                .and_then(|rest| rest.split_once("/-/changes/"))
+                .is_some_and(|(path, number)| {
+                    self.scope("forge.test", path).is_some() && number.parse::<u64>().is_ok()
+                })
+        }
+
+        async fn account_key(&self) -> Option<String> {
+            Some("forge:devuser".into())
+        }
+
+        async fn canonical_scope(&self, scope: &ChangeRequestScope) -> Option<ChangeRequestScope> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Some(scope.clone())
+        }
+
+        async fn list_page(
+            &self,
+            scope: &ChangeRequestScope,
+            _filter: ChangeRequestFilter,
+            _after: Option<&str>,
+            _refresh: bool,
+            _cached: bool,
+        ) -> Result<ChangeRequestPage, ChangeRequestError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let items = self
+                .repositories
+                .lock()
+                .unwrap()
+                .get(&scope.path().to_ascii_lowercase())
+                .cloned()
+                .ok_or(ChangeRequestError::CommandFailed)?;
+            Ok(ChangeRequestPage {
+                total_count: Some(items.len() as u64),
+                items,
+                next_cursor: None,
+                fetched_at: Some(chrono::Utc::now()),
+            })
+        }
+
+        async fn change_request(
+            &self,
+            url: &str,
+            diff: bool,
+            _refresh: bool,
+            _head: Option<&str>,
+            _base: Option<&str>,
+        ) -> Result<serde_json::Value, ChangeRequestError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(if diff {
+                serde_json::Value::String(String::new())
+            } else {
+                serde_json::json!({ "url": url })
+            })
+        }
+
+        async fn post_comment(
+            &self,
+            _url: &str,
+            body: &str,
+        ) -> Result<ChangeRequestComment, ChangeRequestError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ChangeRequestComment {
+                body: body.into(),
+                viewer_did_author: true,
+                ..Default::default()
+            })
+        }
+    }
+
+    /// GitHub, unable to start a process, then the forge.
+    fn registry(forge: Forge) -> (ChangeRequestBoardProviders, Arc<Forge>) {
+        let forge = Arc::new(forge);
+        let providers = ChangeRequestBoardProviders::with_adapters(vec![
+            Arc::new(GitHubCli::offline()),
+            forge.clone(),
+        ]);
+        (providers, forge)
+    }
+
+    fn adapter_for(providers: &ChangeRequestBoardProviders, wire: &str) -> Option<&'static str> {
+        let scope = providers.parse(wire)?;
+        providers
+            .for_scope(&scope)
+            .ok()
+            .map(|adapter| adapter.provider_id())
     }
 
     #[test]
-    fn hosts_route_to_their_adapter() {
-        let providers = github_only();
-        for host in ["github.com", "GitHub.com"] {
-            assert_eq!(
-                providers
-                    .for_host(host)
-                    .map(|adapter| adapter.provider_id()),
-                Some(GITHUB_PROVIDER),
-                "{host}"
-            );
-        }
-        // Enterprise and other providers have no adapter yet.
-        for host in ["gitlab.com", "github.example.com", ""] {
-            assert!(providers.for_host(host).is_none(), "{host}");
-        }
-        assert_eq!(
-            providers.scope("GitHub.com", "acme/zeron"),
-            ChangeRequestScope::from_wire("acme/zeron")
-        );
-        assert_eq!(providers.scope("gitlab.com", "acme/zeron"), None);
-    }
-
-    #[test]
-    fn urls_route_to_the_adapter_that_owns_them() {
-        let providers = github_only();
-        assert_eq!(
-            providers
-                .for_url("https://github.com/acme/zeron/pull/12")
-                .map(|adapter| adapter.provider_id()),
-            Ok(GITHUB_PROVIDER)
-        );
-        for url in [
-            "https://gitlab.com/acme/zeron/-/merge_requests/12",
-            "https://github.example.com/acme/zeron/pull/12",
-            "not a url",
+    fn wire_scopes_route_by_host_and_each_adapter_names_its_paths() {
+        let (providers, _) = registry(Forge::new());
+        for (wire, provider, canonical) in [
+            ("acme/zeron", Some("github"), "acme/zeron"),
+            ("GitHub.com/acme/zeron", Some("github"), "acme/zeron"),
+            (
+                "Forge.test/team/platform/app",
+                Some("forge"),
+                "forge.test/team/platform/app",
+            ),
+            (
+                "forge.test/a/b/c/d/e",
+                Some("forge"),
+                "forge.test/a/b/c/d/e",
+            ),
+            // GitHub repositories are never nested; the forge stops at four
+            // groups, tighter than the wire.
+            ("github.com/acme/zeron/extra", None, ""),
+            ("forge.test/a/b/c/d/e/f", None, ""),
+            // No adapter serves this host.
+            ("other.test/team/app", None, ""),
+            ("not a scope", None, ""),
         ] {
-            assert_eq!(
-                providers.for_url(url).err(),
-                Some(ChangeRequestError::UnsupportedRepository),
-                "{url}"
-            );
+            assert_eq!(adapter_for(&providers, wire), provider, "{wire}");
+            if provider.is_some() {
+                assert_eq!(providers.parse(wire).unwrap().to_string(), canonical);
+            }
         }
+        assert_eq!(
+            providers.scope("FORGE.test", "team/app"),
+            ChangeRequestScope::parse("forge.test/team/app")
+        );
+        assert!(providers.serves_host("forge.test") && providers.serves_host("GitHub.com"));
+        assert!(!providers.serves_host("other.test"));
+    }
+
+    #[test]
+    fn hosts_more_than_one_adapter_claims_go_to_the_first_registered() {
+        let claiming = || Arc::new(Forge::serving(&["forge.test", "github.com"]));
+        let github_first = ChangeRequestBoardProviders::with_adapters(vec![
+            Arc::new(GitHubCli::offline()),
+            claiming(),
+        ]);
+        assert_eq!(adapter_for(&github_first, "acme/zeron"), Some("github"));
+        let forge_first = ChangeRequestBoardProviders::with_adapters(vec![
+            claiming(),
+            Arc::new(GitHubCli::offline()),
+        ]);
+        assert_eq!(adapter_for(&forge_first, "acme/zeron"), Some("forge"));
+        assert_eq!(
+            adapter_for(&forge_first, "forge.test/team/app"),
+            Some("forge")
+        );
     }
 
     #[tokio::test]
-    async fn unserved_scopes_and_urls_fail_before_any_provider_call() {
-        // The real `gh` would run if routing reached the adapter.
-        let providers = github_only();
-        let nested = ChangeRequestScope {
-            provider: "gitlab",
-            host: "gitlab.com".into(),
-            path: "acme/platform/team/api".into(),
-        };
-        assert_eq!(
-            providers
-                .list_page(&nested, ChangeRequestFilter::All, None, false, false)
-                .await
-                .err(),
-            Some(ChangeRequestError::UnsupportedRepository)
-        );
-        // A scope claiming another provider on a served host is refused too.
-        let mislabelled = ChangeRequestScope {
-            provider: "gitlab",
-            ..ChangeRequestScope::from_wire("acme/zeron").unwrap()
-        };
-        assert_eq!(
-            providers
-                .list_page(&mislabelled, ChangeRequestFilter::All, None, false, false)
-                .await
-                .err(),
-            Some(ChangeRequestError::UnsupportedRepository)
-        );
-        assert_eq!(providers.canonical_scope(&nested).await, None);
-        let url = "https://gitlab.com/acme/zeron/-/merge_requests/12";
-        assert_eq!(
-            providers
-                .change_request(url, false, false, None, None)
-                .await
-                .err(),
-            Some(ChangeRequestError::UnsupportedRepository)
-        );
-        assert_eq!(
-            providers.post_comment(url, "hello").await.err(),
-            Some(ChangeRequestError::UnsupportedRepository)
-        );
-    }
-
-    #[test]
-    fn wire_repositories_are_github_scopes() {
-        let scope = ChangeRequestScope::from_wire("Acme/zeron.app").unwrap();
-        assert_eq!(scope.provider, GITHUB_PROVIDER);
-        assert_eq!(scope.host, GITHUB_HOST);
-        assert_eq!(scope.path, "Acme/zeron.app");
-        assert_eq!(scope.to_wire(), "Acme/zeron.app");
-        assert_eq!(
-            ChangeRequestScope::from_wire(&scope.to_wire()),
-            Some(scope.clone())
-        );
-        assert!(scope.same_repository(&ChangeRequestScope::from_wire("acme/ZERON.app").unwrap()));
-        for repository in [
-            "acme",
-            "acme/zeron/extra",
-            "repo:acme/zeron",
-            "../zeron",
-            "",
+    async fn unserved_scopes_and_urls_fail_before_any_adapter_call() {
+        let (providers, forge) = registry(Forge::new().with_repository("team/app", &[7]));
+        let unserved = ChangeRequestScope::new("other.test", "team/app").unwrap();
+        let nested_github = ChangeRequestScope::new("github.com", "acme/zeron/extra").unwrap();
+        for scope in [&unserved, &nested_github] {
+            assert_eq!(
+                providers
+                    .list_page(scope, ChangeRequestFilter::All, None, false, false)
+                    .await
+                    .err(),
+                Some(ChangeRequestError::UnsupportedRepository),
+                "{scope}"
+            );
+            assert_eq!(providers.canonical_scope(scope).await, None);
+        }
+        for url in [
+            "https://other.test/team/app/-/changes/7",
+            "https://forge.test/a/b/c/d/e/f/-/changes/7",
+            "not a url",
         ] {
             assert_eq!(
-                ChangeRequestScope::from_wire(repository),
-                None,
-                "{repository}"
+                providers
+                    .change_request(url, false, false, None, None)
+                    .await
+                    .err(),
+                Some(ChangeRequestError::UnsupportedRepository),
+                "{url}"
+            );
+            assert_eq!(
+                providers.post_comment(url, "hello").await.err(),
+                Some(ChangeRequestError::UnsupportedRepository)
             );
         }
-    }
-
-    #[test]
-    fn nested_paths_are_representable() {
-        let scope = ChangeRequestScope {
-            provider: "gitlab",
-            host: "gitlab.com".into(),
-            path: "acme/platform/team/api".into(),
-        };
-        assert_eq!(scope.path.split('/').count(), 4);
-        assert!(scope.same_repository(&ChangeRequestScope {
-            path: "Acme/Platform/team/api".into(),
-            ..scope.clone()
-        }));
-        assert!(!scope.same_repository(&ChangeRequestScope {
-            provider: GITHUB_PROVIDER,
-            ..scope.clone()
-        }));
-        // The wire keeps today's strict owner/repo form in this version.
-        assert_eq!(ChangeRequestScope::from_wire(&scope.path), None);
+        assert_eq!(forge.calls(), 0);
+        // A served scope reaches its adapter.
+        let scope = providers.parse("forge.test/team/app").unwrap();
+        let page = providers
+            .list_page(&scope, ChangeRequestFilter::All, None, false, false)
+            .await
+            .unwrap();
+        assert_eq!(page.items[0].url, "https://forge.test/team/app/-/changes/7");
+        assert_eq!(forge.calls(), 1);
     }
 }

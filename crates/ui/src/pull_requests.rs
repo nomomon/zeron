@@ -49,6 +49,8 @@ enum PullRequestsPageError {
     Network,
     RemoteOffline(String),
     UpdateRequired(String),
+    /// The device's engine reads only bare `owner/repo` scopes.
+    HostScopesUnsupported(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -866,11 +868,20 @@ impl PullRequestsPage {
             .text()
             .trim()
             .to_ascii_lowercase();
-        if !valid_repository_filter(&repository) {
-            crate::toast::error(cx, "Enter a repository as owner/name.");
+        // The engine's grammar: a qualified github.com repository is the
+        // same scope as its bare owner/name, which every engine reads.
+        let Some(repository) =
+            zeron_proto::ChangeRequestScope::parse(&repository).map(|scope| scope.to_string())
+        else {
+            let message = if self.target_supports_host_scopes(cx) {
+                "Enter a repository as owner/name, or host/path."
+            } else {
+                "Enter a repository as owner/name."
+            };
+            crate::toast::error(cx, message);
             cx.notify();
             return;
-        }
+        };
         self.close_repository_menu(cx);
         self.initial_scope_task = None;
         self.initial_scope_attempted = true;
@@ -1622,6 +1633,14 @@ impl PullRequestsPage {
             return;
         }
 
+        if !self.target_reads_scope(cx) {
+            self.load_state = PullRequestsLoadState::Failed(
+                PullRequestsPageError::HostScopesUnsupported(target_name),
+            );
+            cx.notify();
+            return;
+        }
+
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
         let mut params = params_for_target(self.target_device.as_deref());
@@ -1717,6 +1736,28 @@ impl PullRequestsPage {
             .ok();
         }));
         cx.notify();
+    }
+
+    /// Whether the target engine reads the board's scope. Engines that
+    /// predate host-qualified scopes take a bare `owner/repo` for github.com,
+    /// so anything else is never sent to them.
+    fn target_reads_scope(&self, cx: &gpui::App) -> bool {
+        self.repository
+            .as_deref()
+            .and_then(zeron_proto::ChangeRequestScope::parse)
+            .is_none_or(|scope| scope.is_legacy())
+            || self.target_supports_host_scopes(cx)
+    }
+
+    fn target_supports_host_scopes(&self, cx: &gpui::App) -> bool {
+        let capability = zeron_proto::capabilities::CHANGE_REQUESTS_HOST_SCOPES_V1;
+        let state = self.state.read(cx);
+        match self.target_device.as_deref() {
+            Some(target) => state.device_supports(target, capability),
+            None => state
+                .engine()
+                .is_some_and(|engine| engine.engine_info().supports(capability)),
+        }
     }
 
     fn store_snapshot(&mut self, at: Instant) {
@@ -3424,17 +3465,10 @@ fn toast_page_error(error: &PullRequestsPageError, suffix: Option<&str>, cx: &mu
     crate::toast::error(cx, message);
 }
 
+/// A board scope in the grammar the engine reads: a bare `owner/repo`, or
+/// `host/path` for engines that accept host-qualified scopes.
 fn valid_repository_filter(value: &str) -> bool {
-    let parts: Vec<_> = value.split('/').collect();
-    parts.len() == 2
-        && parts.iter().all(|part| {
-            !part.is_empty()
-                && *part != "."
-                && *part != ".."
-                && part
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
-        })
+    zeron_proto::ChangeRequestScope::parse(value).is_some()
 }
 
 fn params_for_target(target: Option<&str>) -> serde_json::Value {
@@ -3500,6 +3534,10 @@ fn error_copy(error: &PullRequestsPageError) -> (String, String) {
         PullRequestsPageError::UpdateRequired(name) => (
             format!("Update Zeron on {name}"),
             "This device doesn’t support pull requests yet.".into(),
+        ),
+        PullRequestsPageError::HostScopesUnsupported(name) => (
+            format!("Update Zeron on {name}"),
+            "This device opens only github.com repositories so far.".into(),
         ),
     }
 }
@@ -5409,5 +5447,92 @@ mod tests {
             assert_eq!(page.items.len(), 50, "the late Reviewing reply is ignored");
             assert_eq!(page.load_state, PullRequestsLoadState::Ready);
         });
+    }
+
+    #[test]
+    fn repository_scopes_follow_the_engine_grammar() {
+        for (value, valid) in [
+            ("owner/repo", true),
+            ("forge.test/team/platform/app", true),
+            ("github.com/owner/repo", true),
+            ("owner/repo/extra", false),
+            ("forge.test/team//app", false),
+            ("forge.test:22/team/app", false),
+            ("", false),
+        ] {
+            assert_eq!(valid_repository_filter(value), valid, "{value}");
+        }
+    }
+
+    #[gpui::test]
+    fn host_scopes_load_only_from_engines_that_read_them(cx: &mut gpui::TestAppContext) {
+        let runtime = fixture::runtime();
+        let _guard = runtime.enter();
+        let _settings = fixture::settings(cx, crate::settings::UiSettings::default());
+        let wire = "forge.test/team/platform/app";
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = calls.clone();
+        let rpc = ScriptedRpc::new(move |method, params| {
+            let recorded = recorded.clone();
+            async move {
+                assert_eq!(method, methods::LIST_CHANGE_REQUEST_PAGE);
+                let repository = params["repository"].as_str().unwrap().to_owned();
+                recorded.lock().unwrap().push(repository.clone());
+                zeron_rpc::RpcReply::value(&ChangeRequestPage {
+                    items: vec![pull_request(&repository, 7, 1, 1, 1)],
+                    total_count: Some(1),
+                    ..Default::default()
+                })
+            }
+        });
+        for supported in [false, true] {
+            let client = rpc.client();
+            let (page, cx) = cx.add_window_view(|_, cx| {
+                let mut engine = crate::state::EngineHandle::from_test_client(client);
+                if supported {
+                    engine = engine.with_test_capabilities(&[
+                        zeron_proto::capabilities::CHANGE_REQUESTS_HOST_SCOPES_V1,
+                    ]);
+                }
+                let state = cx.new(|_| {
+                    let mut state = AppState::new();
+                    state.set_test_engine(engine);
+                    state
+                });
+                PullRequestsPage::new(state, cx)
+            });
+            page.update(cx, |page, cx| {
+                page.repository_input
+                    .update(cx, |input, cx| input.set_text(wire.to_uppercase(), cx));
+                page.select_repository(cx);
+            });
+            if supported {
+                settle(
+                    cx,
+                    &runtime,
+                    |page| page.load_state == PullRequestsLoadState::Ready,
+                    &page,
+                    &rpc,
+                );
+                page.read_with(cx, |page, _| {
+                    assert_eq!(page.repository.as_deref(), Some(wire));
+                    assert_eq!(page.items[0].number, 7);
+                });
+                assert_eq!(*calls.lock().unwrap(), [wire]);
+            } else {
+                cx.run_until_parked();
+                page.read_with(cx, |page, _| {
+                    assert_eq!(page.repository.as_deref(), Some(wire));
+                    assert_eq!(
+                        page.load_state,
+                        PullRequestsLoadState::Failed(
+                            PullRequestsPageError::HostScopesUnsupported("This device".into())
+                        ),
+                        "an older engine is never asked"
+                    );
+                });
+                assert!(calls.lock().unwrap().is_empty());
+            }
+        }
     }
 }
