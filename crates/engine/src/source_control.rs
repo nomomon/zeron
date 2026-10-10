@@ -22,6 +22,11 @@ use zeron_proto::{
     ChangeRequestState, ChangeRequestSummary,
 };
 
+use crate::change_request_board::{
+    ChangeRequestBoardProvider, ChangeRequestBoardProviders, ChangeRequestScope, GITHUB_HOST,
+    GITHUB_PROVIDER,
+};
+
 const GIT_TIMEOUT: Duration = Duration::from_secs(10);
 const GITHUB_TIMEOUT: Duration = Duration::from_secs(20);
 const GIT_OUTPUT_LIMIT: usize = 64 * 1024;
@@ -190,10 +195,14 @@ impl ChangeRequestResolver {
     }
 
     /// Resolve just the selected checkout's identity. Local only: no provider
-    /// lookup, repository enumeration, or remote transport. The slug is the
+    /// lookup, repository enumeration, or remote transport. The path is the
     /// remote's as written, which may predate a repository rename; the board
-    /// adopts GitHub's canonical name once its first page loads.
-    pub async fn repository_for_checkout(&self, cwd: &Path) -> Option<String> {
+    /// adopts the provider's canonical name once its first page loads.
+    pub(crate) async fn scope_for_checkout(
+        &self,
+        cwd: &Path,
+        providers: &ChangeRequestBoardProviders,
+    ) -> Option<ChangeRequestScope> {
         let remote_url = match self.inspect_checkout(cwd).await {
             Ok(source) => source.branch.remote_url?,
             // An unborn or detached checkout still has a useful origin.
@@ -203,26 +212,23 @@ impl ChangeRequestResolver {
                     .await?
             }
         };
-        self.github_slug(&remote_url).await
+        self.remote_scope(&remote_url, providers).await
     }
 
     /// Match a PR's repository against every fetch remote. A fork's origin
     /// stays the board's default identity, while upstream is a valid handoff.
     /// Remote URLs are read with local Git only; a remote is never contacted.
-    /// When no remote names the repository as written, `github` resolves each
-    /// remote's slug to GitHub's canonical name, so a checkout cloned before a
+    /// When no remote names the repository as written, its provider resolves
+    /// each remote to its canonical name, so a checkout cloned before a
     /// rename (`acme/old` → `acme/new`) still matches.
-    pub async fn matching_repository_for_checkout(
+    pub(crate) async fn matching_scope_for_checkout(
         &self,
         cwd: &Path,
-        repository: &str,
-        github: &GitHubCli,
-    ) -> Option<String> {
-        if !valid_pr_repository(repository) {
-            return None;
-        }
+        wanted: &ChangeRequestScope,
+        providers: &ChangeRequestBoardProviders,
+    ) -> Option<ChangeRequestScope> {
         let remotes = self.inspector.git_optional(cwd, &["remote"]).await?;
-        let mut slugs = Vec::new();
+        let mut scopes = Vec::new();
         for name in remotes.lines().filter(|name| !name.is_empty()) {
             let Some(urls) = self
                 .inspector
@@ -232,22 +238,25 @@ impl ChangeRequestResolver {
                 continue;
             };
             for url in urls.lines() {
-                if let Some(slug) = self.github_slug(url).await {
-                    if slug.eq_ignore_ascii_case(repository) {
-                        return Some(slug);
+                if let Some(scope) = self.remote_scope(url, providers).await {
+                    if scope.same_repository(wanted) {
+                        return Some(scope);
                     }
-                    if !slugs
-                        .iter()
-                        .any(|seen: &String| seen.eq_ignore_ascii_case(&slug))
+                    // Another host's repository can't be renamed into this one.
+                    if scope.provider == wanted.provider
+                        && scope.host == wanted.host
+                        && !scopes
+                            .iter()
+                            .any(|seen: &ChangeRequestScope| seen.same_repository(&scope))
                     {
-                        slugs.push(slug);
+                        scopes.push(scope);
                     }
                 }
             }
         }
-        for slug in slugs {
-            if let Some(canonical) = github.canonical_repository(&slug).await
-                && canonical.eq_ignore_ascii_case(repository)
+        for scope in scopes {
+            if let Some(canonical) = providers.canonical_scope(&scope).await
+                && canonical.same_repository(wanted)
             {
                 return Some(canonical);
             }
@@ -255,14 +264,39 @@ impl ChangeRequestResolver {
         None
     }
 
-    /// `owner/name` for a remote on github.com. An SSH remote may name a
-    /// host alias from `~/.ssh/config` (`git@github-work:acme/zeron.git`);
-    /// `ssh -G` resolves it locally without connecting.
+    /// The board scope for a remote whose host has an adapter.
+    async fn remote_scope(
+        &self,
+        remote_url: &str,
+        providers: &ChangeRequestBoardProviders,
+    ) -> Option<ChangeRequestScope> {
+        let (host, path) = self
+            .remote_repository(remote_url, |host| providers.for_host(host).is_some())
+            .await?;
+        providers.scope(&host, &path)
+    }
+
+    /// `owner/name` for a remote on github.com.
+    #[cfg(test)]
     async fn github_slug(&self, remote_url: &str) -> Option<String> {
+        self.remote_repository(remote_url, |host| host.eq_ignore_ascii_case(GITHUB_HOST))
+            .await
+            .map(|(_, path)| path)
+    }
+
+    /// The host and `owner/name` of a remote on a host `served` accepts. An
+    /// SSH remote may name a host alias from `~/.ssh/config`
+    /// (`git@github-work:acme/zeron.git`); `ssh -G` resolves it locally
+    /// without connecting.
+    async fn remote_repository(
+        &self,
+        remote_url: &str,
+        served: impl Fn(&str) -> bool,
+    ) -> Option<(String, String)> {
         let remote = parse_git_remote(remote_url)?;
         let slug = format!("{}/{}", remote.owner, remote.repository);
-        if remote.host.eq_ignore_ascii_case("github.com") {
-            return Some(slug);
+        if served(&remote.host) {
+            return Some((remote.host, slug));
         }
         if !is_ssh_remote(remote_url) || !valid_ssh_alias(&remote.host) {
             return None;
@@ -285,8 +319,8 @@ impl ChangeRequestResolver {
             return None;
         }
         ssh_config_hostname(&String::from_utf8_lossy(&output.stdout))
-            .is_some_and(|host| host.eq_ignore_ascii_case("github.com"))
-            .then_some(slug)
+            .filter(|host| served(host))
+            .map(|host| (host.to_ascii_lowercase(), slug))
     }
 
     pub async fn resolve_github(
@@ -848,26 +882,17 @@ impl GitHubCli {
         if after.is_some_and(|cursor| !valid_page_cursor(cursor)) {
             return Err(ChangeRequestError::Decode);
         }
-        let first_page = after.is_none();
-        let stored = match &self.store {
-            Some(store) if first_page => self
-                .store_account()
-                .await
-                .map(|account| (store.clone(), account)),
-            _ => None,
-        };
-        if cached
-            && !refresh
-            && let Some((store, account)) = &stored
-            && let Some(page) = store.load(account, repository, filter).await
-        {
-            return Ok(page);
-        }
-        let page = self.fetch_list_page(repository, filter, after, refresh).await?;
-        if let Some((store, account)) = stored {
-            store.save(&account, repository, filter, &page).await;
-        }
-        Ok(page)
+        crate::change_request_board::stored_page(
+            self,
+            self.store.as_ref(),
+            repository,
+            filter,
+            after,
+            refresh,
+            cached,
+            self.fetch_list_page(repository, filter, after, refresh),
+        )
+        .await
     }
 
     async fn fetch_list_page(
@@ -1154,6 +1179,65 @@ impl ChangeRequestProvider for GitHubCli {
             );
         }
         Ok(None)
+    }
+}
+
+/// The board's github.com adapter. Enterprise hosts open in the browser.
+#[async_trait]
+impl ChangeRequestBoardProvider for GitHubCli {
+    fn provider_id(&self) -> &'static str {
+        GITHUB_PROVIDER
+    }
+
+    fn serves_host(&self, host: &str) -> bool {
+        host.eq_ignore_ascii_case(GITHUB_HOST)
+    }
+
+    fn owns_url(&self, url: &str) -> bool {
+        validated_pull_request_url(url).is_ok()
+    }
+
+    /// Bare `gh` logins, as stores written before other providers keyed them.
+    async fn account_key(&self) -> Option<String> {
+        self.store_account().await
+    }
+
+    async fn canonical_scope(&self, scope: &ChangeRequestScope) -> Option<ChangeRequestScope> {
+        let path = self.canonical_repository(&scope.path).await?;
+        Some(ChangeRequestScope {
+            path,
+            ..scope.clone()
+        })
+    }
+
+    async fn list_page(
+        &self,
+        scope: &ChangeRequestScope,
+        filter: zeron_proto::ChangeRequestFilter,
+        after: Option<&str>,
+        refresh: bool,
+        cached: bool,
+    ) -> Result<zeron_proto::ChangeRequestPage, ChangeRequestError> {
+        GitHubCli::list_page(self, &scope.path, filter, after, refresh, cached).await
+    }
+
+    async fn change_request(
+        &self,
+        url: &str,
+        diff: bool,
+        refresh: bool,
+        head: Option<&str>,
+        base: Option<&str>,
+    ) -> Result<serde_json::Value, ChangeRequestError> {
+        self.detail_request(url, diff, refresh, head, base).await
+    }
+
+    async fn post_comment(
+        &self,
+        url: &str,
+        body: &str,
+    ) -> Result<zeron_proto::ChangeRequestComment, ChangeRequestError> {
+        GitHubCli::post_comment(self, url, body).await
     }
 }
 
@@ -1925,7 +2009,7 @@ fn to_list_item(
     }
     let (head_ref_oid, ci, authored, requested) = pull_request.metadata.into_fields();
     Ok(ChangeRequestListItem {
-        provider: "github".into(),
+        provider: GITHUB_PROVIDER.into(),
         author: pull_request.author.unwrap_or_default(),
         head_ref_oid,
         ci,
@@ -2687,6 +2771,45 @@ mod tests {
         );
         assert_eq!(resolver.github_slug("https://gitlab.com/acme/zeron").await, None);
         assert_eq!(runner.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn board_scopes_route_remotes_by_resolved_host() {
+        let runner = FakeProcessRunner::with_responses([
+            command_success("user git\nhostname GitHub.com\n"),
+            command_success("user git\nhostname gitlab.example.com\n"),
+        ]);
+        let resolver = ChangeRequestResolver {
+            inspector: GitCheckoutInspector::new(runner.clone()),
+            github: GitHubCli::with_runner(runner.clone()),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let providers = ChangeRequestBoardProviders::new(dir.path())
+            .with_github(GitHubCli::with_runner(runner.clone()));
+        let github = ChangeRequestScope::from_wire("acme/zeron");
+        for remote in [
+            "https://github.com/acme/zeron.git",
+            "git@GitHub.com:acme/zeron.git",
+            // The alias's real host names the scope, never the alias.
+            "git@github-work:acme/zeron.git",
+        ] {
+            assert_eq!(
+                resolver.remote_scope(remote, &providers).await,
+                github,
+                "{remote}"
+            );
+        }
+        for remote in [
+            "https://gitlab.com/acme/zeron.git",
+            "git@gitlab-work:acme/zeron.git",
+        ] {
+            assert_eq!(
+                resolver.remote_scope(remote, &providers).await,
+                None,
+                "{remote}"
+            );
+        }
+        assert_eq!(runner.requests().len(), 2);
     }
 
     #[test]
