@@ -72,7 +72,7 @@ use zeron_rpc::{
 
 use crate::agent_accounts::AgentAccounts;
 use crate::auth::Auth;
-use crate::change_request_board::{ChangeRequestBoardProviders, ChangeRequestScope};
+use crate::change_request_board::ChangeRequestBoardProviders;
 use crate::change_requests::CheckoutChangeRequests;
 use crate::diff_sync::CheckoutDiffSync;
 use crate::doc_host::DocHost;
@@ -726,7 +726,9 @@ impl EngineRpc {
 
     #[cfg(test)]
     pub(crate) fn with_github(mut self, github: crate::source_control::GitHubCli) -> Self {
-        self.board_providers = self.board_providers.with_github(github);
+        self.board_providers = self
+            .board_providers
+            .with_adapter(std::sync::Arc::new(github));
         self
     }
 
@@ -2585,7 +2587,7 @@ impl RpcService for EngineRpc {
                 let cwd = cwd.as_path();
                 let resolver = crate::source_control::ChangeRequestResolver::new();
                 let scope = match p.repository {
-                    Some(repository) => match ChangeRequestScope::from_wire(&repository) {
+                    Some(repository) => match self.board_providers.parse(&repository) {
                         Some(wanted) => {
                             resolver
                                 .matching_scope_for_checkout(cwd, &wanted, &self.board_providers)
@@ -2599,7 +2601,7 @@ impl RpcService for EngineRpc {
                             .await
                     }
                 };
-                RpcReply::value(&scope.map(|scope| scope.to_wire()))
+                RpcReply::value(&scope.map(|scope| scope.to_string()))
             }
             methods::LIST_CHANGE_REQUEST_PAGE => {
                 #[derive(Deserialize)]
@@ -2616,8 +2618,10 @@ impl RpcService for EngineRpc {
                     cached: bool,
                 }
                 let p: P = parse_params(params)?;
-                let Some(scope) = ChangeRequestScope::from_wire(&p.repository) else {
-                    return Err(RpcError::BadParams("repository must be owner/repo".into()));
+                let Some(scope) = self.board_providers.parse(&p.repository) else {
+                    return Err(RpcError::BadParams(
+                        "repository must be owner/repo or host/path".into(),
+                    ));
                 };
                 if p.after
                     .as_deref()
