@@ -40,9 +40,10 @@ pub(crate) trait ChangeRequestBoardProvider: Send + Sync {
     /// adapter can open. Caches key on it, so spellings share an entry.
     fn change_request_url(&self, url: &str) -> Option<String>;
 
-    /// How clients name and show this provider, sent with its pages and
-    /// details so no client has to know it.
-    fn presentation(&self) -> ChangeRequestPresentation;
+    /// How clients name and show this provider on `host` (lowercase), sent
+    /// with its pages and details so no client has to know it. A provider
+    /// served from many hosts signs in, and serves images, on each.
+    fn presentation(&self, host: &str) -> ChangeRequestPresentation;
 
     /// Fill a row's presentation fields (its `reference`, avatars) from
     /// what the row already says. Applied to every row served, stored ones
@@ -406,7 +407,7 @@ impl ChangeRequestBoardProviders {
             && let Some((store, account)) = &stored
             && let Some(page) = store.load(account, &repository, filter).await
         {
-            return Ok(present(registered, page));
+            return Ok(present(registered, scope, page));
         }
         let key = format!(
             "list:{}:{filter:?}:{}",
@@ -432,7 +433,7 @@ impl ChangeRequestBoardProviders {
         if let Some((store, account)) = stored {
             store.save(&account, &repository, filter, &page).await;
         }
-        Ok(present(registered, page))
+        Ok(present(registered, scope, page))
     }
 
     /// How clients present `scope`'s provider, for a board that has no page
@@ -443,7 +444,7 @@ impl ChangeRequestBoardProviders {
     ) -> Option<ChangeRequestPresentation> {
         self.for_scope(scope)
             .ok()
-            .map(|registered| registered.adapter.presentation())
+            .map(|registered| registered.adapter.presentation(scope.host()))
     }
 
     /// The detail, or with `diff` the patch. A board that observed a new
@@ -468,6 +469,11 @@ impl ChangeRequestBoardProviders {
             head.unwrap_or_default(),
             base.unwrap_or_default()
         );
+        // The detail is presented for the host its URL names.
+        let host = reqwest::Url::parse(&url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+            .unwrap_or_default();
         let adapter = registered.adapter.clone();
         let (head, base) = (head.map(str::to_owned), base.map(str::to_owned));
         let mut value = registered
@@ -479,7 +485,7 @@ impl ChangeRequestBoardProviders {
             })
             .await?;
         if let Some(detail) = value.as_object_mut().filter(|_| !diff) {
-            let presentation = serde_json::to_value(registered.adapter.presentation())
+            let presentation = serde_json::to_value(registered.adapter.presentation(&host))
                 .map_err(|_| ChangeRequestError::Decode)?;
             detail.insert("presentation".into(), presentation);
         }
@@ -500,7 +506,7 @@ impl ChangeRequestBoardProviders {
         let mut found = registered.adapter.find_for_branch(scope, source).await?;
         if let Some(summary) = &mut found {
             summary.provider = registered.adapter.provider_id().into();
-            summary.features = Some(registered.adapter.presentation().features);
+            summary.features = Some(registered.adapter.presentation(scope.host()).features);
         }
         Ok(found)
     }
@@ -521,12 +527,16 @@ impl ChangeRequestBoardProviders {
 
 /// `page` as clients see it: each row stamped with the adapter that listed
 /// it, whatever it wrote, and presented by it, beside its presentation.
-fn present(registered: &Registered, mut page: ChangeRequestPage) -> ChangeRequestPage {
+fn present(
+    registered: &Registered,
+    scope: &ChangeRequestScope,
+    mut page: ChangeRequestPage,
+) -> ChangeRequestPage {
     for item in &mut page.items {
         item.provider = registered.adapter.provider_id().into();
         registered.adapter.present(item);
     }
-    page.presentation = Some(registered.adapter.presentation());
+    page.presentation = Some(registered.adapter.presentation(scope.host()));
     page
 }
 
@@ -628,14 +638,14 @@ pub(crate) mod tests {
             Some(format!("https://forge.test/{path}/-/changes/{number}"))
         }
 
-        fn presentation(&self) -> ChangeRequestPresentation {
+        fn presentation(&self, host: &str) -> ChangeRequestPresentation {
             ChangeRequestPresentation {
                 provider_name: "Forge".into(),
                 cli_name: "Forge CLI".into(),
                 cli_command: "forge".into(),
-                sign_in_command: "forge login".into(),
+                sign_in_command: format!("forge login {host}"),
                 noun: "change".into(),
-                media_hosts: vec!["forge.test".into()],
+                media_hosts: vec![host.into()],
                 media_rewrites: Vec::new(),
                 features: ChangeRequestFeatures {
                     native_detail: true,
@@ -872,6 +882,9 @@ pub(crate) mod tests {
         let presentation = page.presentation.unwrap();
         assert_eq!(presentation.provider_name, "Forge");
         assert!(presentation.features.native_detail && !presentation.features.comments);
+        // Presented for the scope's host, as pages, details and the
+        // registry's own answer all are.
+        assert_eq!(presentation.sign_in_command, "forge login forge.test");
         assert_eq!(providers.presentation(&scope), Some(presentation.clone()));
         let github = providers.parse("acme/zeron").unwrap();
         assert_eq!(
