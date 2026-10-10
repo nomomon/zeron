@@ -18,7 +18,10 @@ use gpui::{
 use std::time::Duration;
 use std::{cell::RefCell, rc::Rc, sync::Arc, time::Instant};
 use zeron_proto::change_request_assessment::{CiState, Facts, check_failed, check_status};
-use zeron_proto::{ChangeRequestDetail, ChangeRequestListItem};
+use zeron_proto::{
+    ChangeRequestActor, ChangeRequestDetail, ChangeRequestFeatures, ChangeRequestListItem,
+    ChangeRequestPresentation,
+};
 use zeron_rpc::methods;
 
 #[derive(Clone, PartialEq, Action)]
@@ -49,38 +52,52 @@ pub struct AddPullRequestProject(pub String);
 
 /// What went wrong and what to do, in words. Error codes and transport
 /// details never reach the reader.
-fn failure_reason(error: &zeron_rpc::RpcError) -> &'static str {
+fn failure_reason(error: &zeron_rpc::RpcError, presentation: &ChangeRequestPresentation) -> String {
     use zeron_rpc::{RpcError, capability_errors as codes};
+    let provider = &presentation.provider_name;
     match error {
-        RpcError::Capability(code) if code == codes::PULL_REQUESTS_CLI_UNAVAILABLE => {
-            "Install GitHub CLI (gh) on this device and sign in."
-        }
-        RpcError::Capability(code) if code == codes::PULL_REQUESTS_AUTHENTICATION => {
-            "Run gh auth login on this device, then refresh."
-        }
+        RpcError::Capability(code) if code == codes::PULL_REQUESTS_CLI_UNAVAILABLE => format!(
+            "Install {} ({}) on this device and sign in.",
+            presentation.cli_name, presentation.cli_command
+        ),
+        RpcError::Capability(code) if code == codes::PULL_REQUESTS_AUTHENTICATION => format!(
+            "Run {} on this device, then refresh.",
+            presentation.sign_in_command
+        ),
         RpcError::Capability(code) if code == codes::PULL_REQUESTS_RATE_LIMITED => {
-            "GitHub’s rate limit was reached. Try again in 15 minutes."
+            format!("{provider}’s rate limit was reached. Try again in 15 minutes.")
         }
         RpcError::Capability(code) if code == codes::PULL_REQUESTS_TIMEOUT => {
-            "GitHub didn’t respond in time. Try again."
+            format!("{provider} didn’t respond in time. Try again.")
         }
-        RpcError::Capability(code) if code == codes::PULL_REQUESTS_DECODE => {
-            "GitHub’s response was too large or unreadable. Open it on GitHub instead."
-        }
-        RpcError::UnknownMethod(_) => "Update Zeron on the selected device.",
-        _ => "Check the link and your connection, then try again.",
+        RpcError::Capability(code) if code == codes::PULL_REQUESTS_DECODE => format!(
+            "{provider}’s response was too large or unreadable. Open it on {provider} instead."
+        ),
+        RpcError::UnknownMethod(_) => "Update Zeron on the selected device.".into(),
+        _ => "Check the link and your connection, then try again.".into(),
     }
 }
 
-pub fn open(url: &str, window: &mut Window, cx: &mut App) {
-    open_on_device(url, None, window, cx);
+/// Open `url`, natively when its provider's `features` say the engine reads
+/// it (see [`crate::pull_request_provider::opens_natively`]), else in the
+/// browser.
+pub fn open(
+    url: &str,
+    features: Option<&ChangeRequestFeatures>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    open_on_device(url, None, features, window, cx);
 }
 
-pub fn open_on_device(url: &str, device: Option<String>, window: &mut Window, cx: &mut App) {
-    // The native view reads github.com through `gh`; pull requests on other
-    // hosts open in the browser.
-    let on_github = url::Url::parse(url).is_ok_and(|url| url.host_str() == Some("github.com"));
-    if !on_github
+pub fn open_on_device(
+    url: &str,
+    device: Option<String>,
+    features: Option<&ChangeRequestFeatures>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if !crate::pull_request_provider::opens_natively(url, features)
         || settings::current(cx).pull_request_destination == PullRequestDestination::External
     {
         cx.open_url(url);
@@ -371,6 +388,9 @@ pub struct PullRequestDetailPage {
     selection_prefix: String,
     cache: Rc<RefCell<PullRequestCache>>,
     preview: Option<ChangeRequestListItem>,
+    /// The board's presentation for this provider, until the detail brings
+    /// its own.
+    board_presentation: Option<ChangeRequestPresentation>,
     error: Option<String>,
     loading: bool,
     fetched: Option<Instant>,
@@ -444,6 +464,7 @@ impl PullRequestDetailPage {
             selection_prefix: format!("pr-detail-{}-", cx.entity_id().as_u64()),
             cache,
             preview,
+            board_presentation: None,
             error: None,
             loading: false,
             fetched: None,
@@ -588,6 +609,32 @@ impl PullRequestDetailPage {
             page.load(stale, cx);
         }
         page
+    }
+
+    pub(crate) fn set_board_presentation(
+        &mut self,
+        presentation: Option<ChangeRequestPresentation>,
+    ) {
+        self.board_presentation = presentation;
+    }
+
+    /// How to name and show this pull request's provider: the detail's own
+    /// data, else the board's, else the fallback for older engines.
+    pub(super) fn presentation(&self) -> std::borrow::Cow<'_, ChangeRequestPresentation> {
+        crate::pull_request_provider::presentation(
+            self.detail
+                .as_ref()
+                .and_then(|detail| detail.presentation.as_ref())
+                .or(self.board_presentation.as_ref()),
+        )
+    }
+
+    /// Whether the engine sent presentation data, so a missing avatar is
+    /// the provider's and not an older engine's.
+    pub(super) fn presented(&self) -> bool {
+        self.detail
+            .as_ref()
+            .is_some_and(|detail| detail.presentation.is_some())
     }
 
     pub(crate) fn titlebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -752,9 +799,10 @@ impl PullRequestDetailPage {
         self.loading = true;
         self.error = None;
         let params = self.params(refresh);
+        let presentation = self.presentation().into_owned();
         self.task = Some(cx.spawn(async move |this, cx| {
             let result = engine.client().call(methods::GET_CHANGE_REQUEST, params).await
-                .map_err(|error| format!("Couldn’t load this pull request. {}", failure_reason(&error)))
+                .map_err(|error| format!("Couldn’t load this pull request. {}", failure_reason(&error, &presentation)))
                 .and_then(|value| serde_json::from_value::<ChangeRequestDetail>(value).map_err(|_| "The device sent a pull request this version can’t read. Update Zeron on the selected device.".to_owned()));
             // Large descriptions and review threads must not stall the UI thread.
             let result = cx.background_executor().spawn(async move {
@@ -817,12 +865,18 @@ impl PullRequestDetailPage {
         let params = self.params(refresh);
         let detail = self.detail.as_ref().unwrap();
         let revisions = (detail.base_ref_oid.clone(), detail.head_ref_oid.clone());
+        let presentation = self.presentation().into_owned();
         self.diff_task = Some(cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
                 .call(methods::GET_CHANGE_REQUEST_DIFF, params)
                 .await
-                .map_err(|error| format!("Couldn’t load the diff. {}", failure_reason(&error)))
+                .map_err(|error| {
+                    format!(
+                        "Couldn’t load the diff. {}",
+                        failure_reason(&error, &presentation)
+                    )
+                })
                 .and_then(|value| {
                     serde_json::from_value::<String>(value)
                         .map_err(|_| "The device returned an invalid diff.".to_owned())
@@ -1095,6 +1149,7 @@ fn rich_text(
     body: &crate::markdown::BlockTree,
     key: String,
     url: &str,
+    presentation: &ChangeRequestPresentation,
     theme: &Theme,
     window: &mut Window,
     owner: gpui::WeakEntity<PullRequestDetailPage>,
@@ -1103,6 +1158,7 @@ fn rich_text(
         tasks: None,
         media: Some(super::pull_request_media::media(
             url,
+            presentation.clone(),
             Rc::new(move |source, window, cx| {
                 let _ = owner.update(cx, |page, cx| page.open_image(source, window, cx));
             }),
@@ -1234,13 +1290,19 @@ fn ci_status(detail: &ChangeRequestDetail) -> &'static str {
     }
 }
 
-fn assessment_ci_empty_copy(detail: &ChangeRequestDetail) -> &'static str {
+fn assessment_ci_empty_copy(
+    detail: &ChangeRequestDetail,
+    presentation: &ChangeRequestPresentation,
+) -> String {
     if Facts::from_detail(detail).assess().ci.state == CiState::Unknown {
-        "CI metadata is unavailable. Refresh to try again."
+        "CI metadata is unavailable. Refresh to try again.".into()
     } else if Facts::from_detail(detail).assess().ci.state == CiState::NoChecks {
-        "No checks reported."
+        "No checks reported.".into()
     } else {
-        "Check details are unavailable. Open this pull request on GitHub."
+        format!(
+            "Check details are unavailable. Open this pull request on {}.",
+            presentation.provider_name
+        )
     }
 }
 
@@ -1313,7 +1375,8 @@ const CARD_GAP: f32 = 12.0;
 /// Title and metadata line; shared by the loaded page and its placeholder.
 fn detail_header(
     title: &str,
-    author: &str,
+    author: &ChangeRequestActor,
+    presented: bool,
     repository: String,
     number: u64,
     fetched: Option<Instant>,
@@ -1356,15 +1419,16 @@ fn detail_header(
                         .items_center()
                         .gap(px(8.0))
                         .child(super::pull_request_media::avatar(
-                            author,
+                            &author.login,
+                            crate::pull_request_provider::avatar_url(author, presented),
                             "pr-author".into(),
                             20.0,
                             theme,
                         ))
-                        .child(if author.is_empty() {
+                        .child(if author.login.is_empty() {
                             "Deleted account".to_owned()
                         } else {
-                            author.to_owned()
+                            author.login.clone()
                         }),
                 )
                 .child(meta_item(
@@ -1486,6 +1550,11 @@ impl Render for PullRequestDetailPage {
             window.focus(&focus, cx);
         }
         let theme = Theme::of(cx).clone();
+        let presentation = self.presentation().into_owned();
+        let presented = self.presented();
+        let pr_host = url::Url::parse(&self.url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_owned));
         let empty_activity = self.tab == Tab::Activity
             && self
                 .detail
@@ -1521,19 +1590,26 @@ impl Render for PullRequestDetailPage {
                     );
             }
             if let Some(detail) = &self.detail {
-                let repository = self
-                    .url
-                    .split('/')
-                    .skip(3)
-                    .take(2)
-                    .collect::<Vec<_>>()
-                    .join("/");
+                // The board's row names the repository. A link opened from
+                // elsewhere reads as owner/name, as on GitHub.
+                let repository = self.preview.as_ref().map_or_else(
+                    || {
+                        self.url
+                            .split('/')
+                            .skip(3)
+                            .take(2)
+                            .collect::<Vec<_>>()
+                            .join("/")
+                    },
+                    |preview| preview.repository.clone(),
+                );
                 column = column
                     .when(self.tab != Tab::Code, |column| {
                         column.child(
                             detail_header(
                                 &detail.title,
-                                &detail.author.login,
+                                &detail.author,
+                                presented,
                                 repository,
                                 detail.number,
                                 self.fetched,
@@ -1654,7 +1730,7 @@ impl Render for PullRequestDetailPage {
                                 div()
                                     .p(px(16.0))
                                     .text_color(theme.text_muted)
-                                    .child(assessment_ci_empty_copy(detail)),
+                                    .child(assessment_ci_empty_copy(detail, &presentation)),
                             );
                         }
                         for (index, check) in detail
@@ -1815,7 +1891,9 @@ impl Render for PullRequestDetailPage {
                         column = column
                             .child(assessment_card)
                             .child(checks.mt(px(CARD_GAP)))
-                            .child(self.handoff_card(detail, &theme, cx));
+                            .when(presentation.features.handoff, |column| {
+                                column.child(self.handoff_card(detail, &theme, cx))
+                            });
                         let description = div()
                             .p(px(16.0))
                             .min_h(px(60.0))
@@ -1830,6 +1908,7 @@ impl Render for PullRequestDetailPage {
                                         body,
                                         format!("{}description", self.selection_prefix),
                                         &self.url,
+                                        &presentation,
                                         &theme,
                                         window,
                                         cx.weak_entity(),
@@ -1878,7 +1957,7 @@ impl Render for PullRequestDetailPage {
                             .flex_col()
                             .when(detail.review_threads.is_none() && !activity.is_empty(), |thread| thread.child(
                                 div().mb(px(16.0)).text_color(theme.text_muted)
-                                    .child("Inline review threads are unavailable. Refresh or open this pull request on GitHub to read them.")));
+                                    .child(format!("Inline review threads are unavailable. Refresh or open this pull request on {} to read them.", presentation.provider_name))));
                         if activity.is_empty() {
                             thread = thread
                                 .pl_0()
@@ -1917,7 +1996,7 @@ impl Render for PullRequestDetailPage {
                                             .w_full()
                                             .mt(px(6.0))
                                             .text_color(theme.text_muted)
-                                            .child(if detail.review_threads.is_some() { "Comments and reviews will appear here. Start the conversation below." } else { "Inline review threads are unavailable. Refresh or open this pull request on GitHub to read them." }),
+                                            .child(if detail.review_threads.is_some() { "Comments and reviews will appear here. Start the conversation below.".to_owned() } else { format!("Inline review threads are unavailable. Refresh or open this pull request on {} to read them.", presentation.provider_name) }),
                                     ),
                             );
                         }
@@ -1964,6 +2043,10 @@ impl Render for PullRequestDetailPage {
                                                     .gap(px(8.0))
                                                     .child(super::pull_request_media::avatar(
                                                         &comment.author.login,
+                                                        crate::pull_request_provider::avatar_url(
+                                                            &comment.author,
+                                                            presented,
+                                                        ),
                                                         format!("pr-actor-{index}").into(),
                                                         24.0,
                                                         &theme,
@@ -2012,12 +2095,14 @@ impl Render for PullRequestDetailPage {
                                                     "Unresolved"
                                                 };
                                                 // One quiet line: where the comment sits (a link
-                                                // to it on GitHub), then its state.
+                                                // to it on the pull request's own host), then
+                                                // its state.
                                                 let link = url::Url::parse(&comment.url)
                                                     .ok()
                                                     .filter(|url| {
                                                         url.scheme() == "https"
-                                                            && url.host_str() == Some("github.com")
+                                                            && url.host_str().is_some()
+                                                            && url.host_str() == pr_host.as_deref()
                                                     });
                                                 let mut details = vec![status];
                                                 if review.is_outdated {
@@ -2062,9 +2147,10 @@ impl Render for PullRequestDetailPage {
                                                                     format!("pr-inline-link-{index}")
                                                                 })
                                                                 .role(gpui::Role::Link)
-                                                                .aria_label(
-                                                                    "Open review comment on GitHub",
-                                                                )
+                                                                .aria_label(format!(
+                                                                    "Open review comment on {}",
+                                                                    presentation.provider_name
+                                                                ))
                                                                 .tab_index(0)
                                                                 .cursor_pointer()
                                                                 .hover(|style| {
@@ -2103,6 +2189,7 @@ impl Render for PullRequestDetailPage {
                                                             self.selection_prefix
                                                         ),
                                                         &self.url,
+                                                        &presentation,
                                                         &theme,
                                                         window,
                                                         cx.weak_entity(),
@@ -2122,7 +2209,8 @@ impl Render for PullRequestDetailPage {
                     column = column.child(match &self.preview {
                         Some(preview) => detail_header(
                             &preview.title,
-                            &preview.author.login,
+                            &preview.author,
+                            preview.reference.is_some(),
                             preview.repository.clone(),
                             preview.number,
                             None,
@@ -2215,7 +2303,8 @@ impl Render for PullRequestDetailPage {
         if self.tab_slide.animating_at(Instant::now()) {
             window.request_animation_frame();
         }
-        let composer = (self.tab == Tab::Activity).then(|| self.comment_composer(&theme, cx));
+        let composer = (self.tab == Tab::Activity && self.presentation().features.comments)
+            .then(|| self.comment_composer(&theme, cx));
         let mut root = div()
             .size_full()
             .relative()
@@ -2582,6 +2671,7 @@ mod tests {
                     mergeability: zeron_proto::ChangeRequestMergeability::Unknown,
                     created_at: chrono::Utc::now(),
                     updated_at: chrono::Utc::now(),
+                    reference: None,
                 }),
                 window,
                 cx,
@@ -2849,16 +2939,36 @@ mod tests {
             RpcError::Transport("socket reset by peer".into()),
             RpcError::UnknownMethod(methods::GET_CHANGE_REQUEST.into()),
         ] {
-            let reason = failure_reason(&error);
+            let reason = failure_reason(&error, &crate::pull_request_provider::presentation(None));
             assert!(!reason.contains("pull_requests."), "{reason}");
             assert!(!reason.contains("socket"), "{reason}");
             assert!(!reason.contains("GetChangeRequest"), "{reason}");
         }
         assert_eq!(
-            failure_reason(&RpcError::Capability(
-                codes::PULL_REQUESTS_AUTHENTICATION.into()
-            )),
+            failure_reason(
+                &RpcError::Capability(codes::PULL_REQUESTS_AUTHENTICATION.into()),
+                &crate::pull_request_provider::presentation(None)
+            ),
             "Run gh auth login on this device, then refresh."
+        );
+        let forge = ChangeRequestPresentation {
+            provider_name: "Forge".into(),
+            sign_in_command: "forge login".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            failure_reason(
+                &RpcError::Capability(codes::PULL_REQUESTS_AUTHENTICATION.into()),
+                &forge
+            ),
+            "Run forge login on this device, then refresh."
+        );
+        assert!(
+            failure_reason(
+                &RpcError::Capability(codes::PULL_REQUESTS_TIMEOUT.into()),
+                &forge
+            )
+            .starts_with("Forge didn’t respond")
         );
     }
 
@@ -3394,7 +3504,7 @@ mod tests {
                     });
                     page.detail.as_mut().unwrap().comments.push(zeron_proto::ChangeRequestComment {
                         viewer_did_author: true, body: "My comment".into(),
-                        author: zeron_proto::ChangeRequestActor { login: "viewer".into() }, ..Default::default()
+                        author: zeron_proto::ChangeRequestActor { login: "viewer".into(), avatar_url: None }, ..Default::default()
                     });
                     page.activity_bodies = vec![
                         super::super::pull_request_media::parse_description("My comment"),
